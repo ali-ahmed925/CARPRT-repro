@@ -6,3 +6,7 @@ __pycache__/
 .venv/
 venv/
 *.pt
+
+# prompt-operator embedding cache (hundreds of MB of .pt tensors)
+.operator_cache/
+*.json.results

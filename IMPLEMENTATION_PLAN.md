@@ -139,10 +139,48 @@ generative; the hull stops being a boundary.
 
 **H:** prompt operators are class-transferable.
 
-Fit $\{T_i\}$ on 80% of classes, predict $z_{i,c}$ for the held-out 20%, report cosine against the true
-encoder output. Median cosine $>0.9$ ⟹ prompts are operator-like and the pool compresses. Then the
-decisive test: classify using *synthesized* embeddings only and check accuracy matches true encodings.
-That single number decides the paper.
+Fit $\{T_i\}$, predict $z_{i,c}$ for held-out classes, report cosine against the true encoder output.
+Then the decisive test: classify using *synthesized* embeddings only and check accuracy matches true
+encodings. That single number decides the paper.
+
+### CORRECTION (2026-08-01): the fit corpus must satisfy $C \ge d$
+
+Each $T_i$ has $d^2 = 262{,}144$ unknowns while each class contributes one $d$-dimensional equation.
+A single fine-grained benchmark is hopeless: **Oxford Pets gives 37 × 512 = 18,944 equations for
+262,144 unknowns**, so $M^\top M$ has rank 37 and a 475-dimensional null space — infinitely many
+operators fit perfectly, and a poor transfer score would only prove $C \ll d$, not that the hypothesis
+is false. ImageNet gives 1000 × 512 = **512,000** equations and is comfortably overdetermined.
+
+Consequences, now baked into the code:
+
+- **Fit on a pooled class-name vocabulary, evaluate elsewhere.** ImageNet's 1000 class names are
+  hardcoded in `datasets/imagenet.py` — **no ImageNet images are required**, since operator fitting is
+  entirely text-side. Held-out evaluation runs on Oxford Pets.
+- **Leave-one-dataset-out beats leave-out-classes.** Fitting on ImageNet and testing on Pets asks
+  whether an operator learned from *tench* and *airliner* transfers to *abyssinian* — the actual
+  universality claim. Class names shared between the two corpora are dropped to prevent leakage.
+- **RN50 needs a larger vocabulary.** Its embed dim is 1024 > 1000, so ImageNet alone is
+  underdetermined. Use ViT-B/16, pool more datasets, or use a constrained estimator.
+- `promptop.corpus.check_determined` hard-fails on $C < d$ rather than silently producing a
+  meaningless fit.
+
+### Implementation status (branch `prompt-operator`)
+
+Complete and smoke-tested end to end. `promptop/` = `corpus` (pooling, leakage, determinacy guard),
+`embed` (encoding + cache, strips `logit_scale`), `fit` (ridge→identity / Procrustes / low-rank +
+additive and identity nulls + hierarchical group refinement), `evaluate` (class-centred cosine,
+residual-structure test, manifold report), `manifold` (operator PCA, novel-prompt synthesis,
+interpolation), `infer` (synthesized → drop-in `text_feature`, CARPRT + MPE accuracy). Driver:
+`run_operator.py {fit,classify,all}`.
+
+Two decision points the run produces automatically:
+
+- **Does the operator beat the additive null** on class-centred cosine? If not, $d^2$ parameters are
+  unjustified and the direction is dead.
+- **Are residuals domain-structured?** Class names are clustered into pseudo-domains and within- vs
+  between-domain residual cosine is compared. A positive gap means prompt effects are genuinely
+  class-dependent, so the universal operator is insufficient and `--group-refine` is required. This is
+  the empirical answer to the "sketch of a cat ≠ sketch of a building" objection.
 
 ---
 
