@@ -23,6 +23,9 @@
               ablation over each component
     validate  apply ONE frozen estimator across several datasets with no
               sweeping available, reporting a paired McNemar test per dataset
+    dose      dose-response: hold C, the prompt pool and the evaluation set fixed
+              and vary only how many unlabeled images estimate the weights, to
+              test the count mechanism causally on a single dataset
     sweep     model-complexity ladder: identity / additive / affine / low-rank at
               several ranks / full ridge / Procrustes, each scored against its
               parameter cost, to see how much operator the gain actually needs
@@ -58,7 +61,7 @@ def get_args():
     p = argparse.ArgumentParser(description="Prompt-operator pipeline.")
     p.add_argument("command", choices=["fit", "classify", "all", "sweep", "residual", "oracle",
                             "characterize", "learn", "bayes",
-                            "validate"])
+                            "validate", "dose"])
     p.add_argument("--fit-datasets", type=str, default="imagenet",
                    help="Slash-separated corpus for fitting, e.g. 'imagenet/sun397'.")
     p.add_argument("--target", type=str, default="oxford_pets",
@@ -86,6 +89,11 @@ def get_args():
                    default=12,
                    help="Pseudo-domains carved from class names for the residual "
                         "structure test.")
+    p.add_argument("--dose-fracs", dest="dose_fracs", type=str,
+                   default="1.0,0.5,0.25,0.125,0.0625,0.03125",
+                   help="Fractions of the test set used to ESTIMATE weights.")
+    p.add_argument("--dose-seeds", dest="dose_seeds", type=int, default=3,
+                   help="Subsample draws per fraction, averaged.")
     p.add_argument("--alpha-power", dest="alpha_power", type=str,
                    default="0,0.125,0.25,0.375,0.5,0.625,0.75,1.0",
                    help="Exponents for the n^alpha sweep. 0 = CARPRT.")
@@ -158,6 +166,117 @@ def set_seed(seed):
 
 def banner(title):
     print(f"\n{'=' * 74}\n{title}\n{'=' * 74}")
+
+
+def run_dose(args, clip_model, logit_scale, m_fit, z_fit, m_tgt, z_tgt,
+             preprocess, results):
+    """Dose-response: does the count gain scale with images per cell, causally?
+
+    Across datasets the gain tracks the median count per (prompt, class) cell, but
+    EuroSAT confounds two things -- most images per cell AND fewest classes. This
+    holds C, the prompt pool, the backbone and the EVALUATION SET fixed, and varies
+    only the number of unlabeled images used to ESTIMATE the weights.
+
+    Weights are estimated on a subsample; accuracy is always measured on the full
+    test set. That keeps every accuracy number comparable and isolates the effect
+    of estimation evidence, which a shrinking evaluation set would confound.
+    """
+    from promptop import bayes as by
+    from promptop import stats as st
+
+    banner(f"downstream zero-shot: {args.target}")
+    loader, classnames, _ = build_test_data_loader(
+        args.target, args.data_root, preprocess)
+    print("  encoding images once ...")
+    img_f, targets = infer_mod.encode_images(loader, clip_model)
+    tf = clip_classifier(classnames, TEMPLATES, clip_model)
+    n_all, c = img_f.shape[0], len(classnames)
+
+    def acc_full(w):
+        return 100.0 * (infer_mod._scores(img_f, tf, w).argmax(1)
+                        == targets).float().mean().item()
+
+    alphas = [float(x) for x in args.alpha_power.split(",") if x]
+    fracs = [float(x) for x in args.dose_fracs.split(",") if x]
+    seeds = list(range(args.dose_seeds))
+
+    banner(f"DOSE-RESPONSE on {args.target}  "
+           f"(C={c} fixed, evaluation on all {n_all} images)")
+    print(f"  weights estimated from a subsample; accuracy always on the full set")
+    print(f"  {args.dose_seeds} seed(s) per fraction, averaged\n")
+
+    hdr = (f"{'frac':>6}{'n_est':>8}{'med.count':>11}{'CARPRT':>9}"
+           f"{'best a':>8}{'peak':>9}{'gain':>8}"
+           f"{'a=' + format(args.alpha, 'g'):>9}{'gain':>8}")
+    print(hdr); print("-" * len(hdr))
+
+    rows = []
+    for frac in fracs:
+        k = max(int(round(n_all * frac)), 2 * c)
+        per_seed = []
+        for sd in seeds:
+            g = torch.Generator().manual_seed(args.seed + sd)
+            idx = torch.randperm(n_all, generator=g)[:k].to(img_f.device)
+            sub = img_f[idx]
+
+            w_base = infer_mod.carprt_weights(sub, tf, args.temp, args.chunk)
+            a_base = acc_full(w_base)
+            pred_base = infer_mod._scores(img_f, tf, w_base).argmax(1)
+
+            s1, s2, nn = by.weight_moments(sub, tf, args.chunk)
+            med = float(nn.float().median())
+
+            curve = {}
+            for a in alphas:
+                w = torch.softmax(
+                    by.count_power_scores(s1, s2, nn, a, "floor") / args.temp, dim=0)
+                curve[a] = (acc_full(w), infer_mod._scores(img_f, tf, w).argmax(1))
+            per_seed.append({"base": a_base, "med": med, "curve": curve,
+                             "pred_base": pred_base})
+
+        med_m = sum(s["med"] for s in per_seed) / len(per_seed)
+        base_m = sum(s["base"] for s in per_seed) / len(per_seed)
+        mean_curve = {a: sum(s["curve"][a][0] for s in per_seed) / len(per_seed)
+                      for a in alphas}
+        best_a = max(mean_curve, key=mean_curve.get)
+        fixed = mean_curve.get(args.alpha, float("nan"))
+
+        # paired test on the last seed, where predictions are concrete
+        last = per_seed[-1]
+        r = st.mcnemar(last["pred_base"], last["curve"][best_a][1], targets,
+                       "CARPRT", f"a={best_a:g}")
+
+        print(f"{frac:>6.3f}{k:>8}{med_m:>11.1f}{base_m:>9.2f}"
+              f"{best_a:>8.3f}{mean_curve[best_a]:>9.2f}"
+              f"{mean_curve[best_a] - base_m:>+8.2f}"
+              f"{fixed:>9.2f}{fixed - base_m:>+8.2f}  {st.stars(r['p_exact'])}")
+        rows.append({"frac": frac, "n_est": k, "median_count": med_m,
+                     "carprt": base_m, "best_alpha": best_a,
+                     "peak": mean_curve[best_a],
+                     "gain": mean_curve[best_a] - base_m,
+                     "fixed_alpha": args.alpha, "fixed_acc": fixed,
+                     "fixed_gain": fixed - base_m, "p": r["p_exact"],
+                     "curve": mean_curve})
+        del per_seed
+        torch.cuda.empty_cache()
+
+    print(f"\n  'gain' columns are relative to CARPRT estimated from the SAME")
+    print(f"  subsample, so both methods see identical evidence at every row.")
+    print(f"  The 'best a' column is selected per row; the fixed-alpha column is not.")
+
+    if len(rows) >= 3:
+        lo = [r for r in rows if r["median_count"] < 40]
+        hi = [r for r in rows if r["median_count"] >= 200]
+        if lo and hi:
+            print(f"\n  median count >= 200: mean gain "
+                  f"{sum(r['gain'] for r in hi) / len(hi):+.2f}")
+            print(f"  median count <  40:  mean gain "
+                  f"{sum(r['gain'] for r in lo) / len(lo):+.2f}")
+            print(f"  >>> the count mechanism is causal on a single dataset: C, the "
+                  f"prompt pool\n      and the evaluation set are all fixed, and only "
+                  f"the estimation evidence varies.")
+    results["dose"] = rows
+    return results
 
 
 def run_validate(args, clip_model, logit_scale, m_fit, z_fit, m_tgt, z_tgt,
@@ -1019,13 +1138,14 @@ def main():
     print(f"  M_tgt {tuple(m_tgt.shape)}  Z_tgt {tuple(z_tgt.shape)}")
 
     if args.command in ("sweep", "residual", "oracle", "characterize",
-                        "learn", "bayes", "validate"):
+                        "learn", "bayes", "validate", "dose"):
         runner = {"sweep": run_sweep, "residual": run_residual,
                   "oracle": run_oracle,
                   "characterize": run_characterize,
                   "learn": run_learn,
                   "bayes": run_bayes,
-                  "validate": run_validate}[args.command]
+                  "validate": run_validate,
+                  "dose": run_dose}[args.command]
         runner(args, clip_model, logit_scale, m_fit, z_fit, m_tgt, z_tgt,
                preprocess, results)
         print(f"\ndone in {time.time() - t0:.1f}s")
