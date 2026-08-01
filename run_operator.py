@@ -89,6 +89,11 @@ def get_args():
                    default=12,
                    help="Pseudo-domains carved from class names for the residual "
                         "structure test.")
+    p.add_argument("--impl", dest="impl", type=str, default="v1",
+                   choices=["v1", "v2"],
+                   help="v1 (default): original scoring; reproduces all numbers "
+                        "generated before 2026-08-02. v2: alpha=0 is bit-exact "
+                        "against CARPRT.")
     p.add_argument("--dose-mode", dest="dose_mode", type=str,
                    default="images", choices=["images", "classes"],
                    help="images: vary how many images estimate the weights. "
@@ -225,7 +230,7 @@ def _dose_classes(args, tf, img_f, targets, classnames, alphas, seeds, results):
             curve = {}
             for a in alphas:
                 w = torch.softmax(
-                    by.count_power_scores(s1, s2, nn, a, "floor") / args.temp, dim=0)
+                    by.count_power_scores(s1, s2, nn, a, impl=args.impl) / args.temp, dim=0)
                 curve[a] = (acc(w), infer_mod._scores(sub_img, sub_tf, w).argmax(1))
             per_seed.append({
                 "base": acc(w_base), "med": float(nn.float().median()),
@@ -362,7 +367,7 @@ def run_dose(args, clip_model, logit_scale, m_fit, z_fit, m_tgt, z_tgt,
             curve = {}
             for a in alphas:
                 w = torch.softmax(
-                    by.count_power_scores(s1, s2, nn, a, "floor") / args.temp, dim=0)
+                    by.count_power_scores(s1, s2, nn, a, impl=args.impl) / args.temp, dim=0)
                 curve[a] = (acc_full(w), infer_mod._scores(img_f, tf, w).argmax(1))
             per_seed.append({"base": a_base, "med": med, "curve": curve,
                              "pred_base": pred_base})
@@ -453,9 +458,10 @@ def run_validate(args, clip_model, logit_scale, m_fit, z_fit, m_tgt, z_tgt,
 
         s1, s2, n = by.weight_moments(img_f, tf, args.chunk)
         w_new = torch.softmax(
-            by.count_power_scores(s1, s2, n, alpha, "floor") / args.temp, dim=0)
+            by.count_power_scores(s1, s2, n, alpha, impl=args.impl) / args.temp, dim=0)
         pred_new = infer_mod._scores(img_f, tf, w_new).argmax(1)
         r = st.mcnemar(pred_base, pred_new, targets, "CARPRT", "ours")
+
 
         row = {"dataset": name, "classes": c, "images": int(img_f.shape[0]),
                "mpe": mpe, "carprt": base, "ours": r["acc_b"],

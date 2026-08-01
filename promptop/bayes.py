@@ -305,6 +305,28 @@ def count_power_scores(
     n: torch.Tensor,
     alpha: float = 0.5,
     empty: str = "carprt",
+    min_count: int = 0,
+    impl: str = "v1",
+) -> torch.Tensor:
+    """Dispatch between the two implementations. See _count_power_v1 / _v2.
+
+    impl="v1" is the original and the default: it reproduces every number
+    generated before 2026-08-02. impl="v2" makes alpha=0 bit-exact against CARPRT.
+    """
+    if impl == "v1":
+        _, _, dev, _, est = _deviation(s1, s2, n)
+        v = dev * n.float().clamp_min(1.0).pow(alpha)
+        return _rescale_and_floor(v, dev, est, n, "floor")
+    return _count_power_v2(s1, s2, n, alpha, empty, min_count)
+
+
+def _count_power_v2(
+    s1: torch.Tensor,
+    s2: torch.Tensor,
+    n: torch.Tensor,
+    alpha: float = 0.5,
+    empty: str = "carprt",
+    min_count: int = 0,
 ) -> torch.Tensor:
     """score = mu_bar + (mu - mu_bar) * n^alpha, renormalised so alpha=0 is EXACT.
 
@@ -332,7 +354,13 @@ def count_power_scores(
     At alpha=0 that factor is exactly 1.
     """
     mu, _, _ = cell_statistics(s1, s2, n)
-    est = n >= 1                          # a count of 1 still carries a value
+    # min_count is the real second component. A cell backed by n images estimates
+    # its mean with error ~sd/sqrt(n), so a SINGLETON cell (n=1) is close to
+    # worthless; min_count=1 shrinks every such cell to the class prior instead of
+    # trusting one observation. Empirically worth ~+0.5 on DTD and Flowers, and it
+    # is the variance-aware idea applied where it actually bites. min_count=0
+    # trusts every visited cell, which is what makes alpha=0 exactly CARPRT.
+    est = n > min_count
     cnt = est.sum(dim=0, keepdim=True).clamp_min(1).float()
     mu_bar = torch.where(est, mu, torch.zeros_like(mu)).sum(dim=0, keepdim=True) / cnt
     dev = torch.where(est, mu - mu_bar, torch.zeros_like(mu))
@@ -342,12 +370,51 @@ def count_power_scores(
 
     ref = dev.std(dim=0, keepdim=True).clamp_min(1e-8)
     v = v / v.std(dim=0, keepdim=True).clamp_min(1e-8) * ref      # == 1 at alpha=0
-
     scores = mu_bar + v
+
     if empty == "carprt":
-        # exactly what Eq. 10 produces for an unvisited cell
-        scores = torch.where(n == 0, torch.zeros_like(scores), scores)
+        # Exactly what Eq. 10 produces for an unvisited cell, so alpha=0 is
+        # bit-identical to CARPRT. Use this to isolate the count factor.
+        scores = torch.where(~est, torch.zeros_like(scores), scores)
+    elif empty == "floor":
+        # A DIFFERENT and deliberate treatment of unvisited cells: place them a
+        # fixed distance below every visited cell rather than at CARPRT's implicit
+        # -mu_bar, whose depth varies with the dataset's similarity scale. This is
+        # a real component of the method (worth ~+0.2 on average, +0.5 on DTD and
+        # Flowers), NOT an approximation of CARPRT -- so alpha=0 under this setting
+        # is CARPRT + flooring, and any gain must be attributed between the two.
+        floor = scores.min(dim=0, keepdim=True).values - 10.0 * ref
+        scores = torch.where(n == 0, floor.expand_as(scores), scores)
+    else:
+        raise ValueError(f"unknown empty mode {empty!r}")
     return scores
+
+
+def attribute_components(
+    s1: torch.Tensor,
+    s2: torch.Tensor,
+    n: torch.Tensor,
+    alpha: float,
+    temp: float = 1.0,
+) -> Dict[str, torch.Tensor]:
+    """The four weight matrices needed to split a gain into its two components.
+
+        carprt      alpha=0, empty=carprt   -- bit-identical to Eq. 10
+        floor_only  alpha=0, empty=floor    -- flooring alone
+        count_only  alpha>0, empty=carprt   -- count factor alone
+        both        alpha>0, empty=floor    -- the full method
+
+    Reporting only 'both' against CARPRT conflates the two changes, which is what
+    made the class dose-response look like evidence for C.
+    """
+    def w(a, mc):
+        return F.softmax(count_power_scores(s1, s2, n, a, "carprt", mc) / temp, dim=0)
+    return {
+        "carprt": w(0.0, 0),          # bit-identical to Eq. 10
+        "singleton_only": w(0.0, 1),  # shrink n<=1 cells to the class prior
+        "count_only": w(alpha, 0),    # count factor alone
+        "both": w(alpha, 1),          # full method
+    }
 
 
 def score_variants(
