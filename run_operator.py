@@ -7,6 +7,10 @@
     all       both, sharing one encode
     residual  estimate prompt weights from the interaction term z - alpha*T m,
               score with the TRUE embeddings; alpha=0 reproduces CARPRT exactly
+    oracle    ceilings for prompt reweighting, using labels purely as a ruler:
+              MPE floor, CARPRT, Eq. 10 with true labels, and the best possible
+              (P, C) weight matrix -- with a held-out split so the ceiling is
+              one a real estimator could actually generalise to
     sweep     model-complexity ladder: identity / additive / affine / low-rank at
               several ranks / full ridge / Procrustes, each scored against its
               parameter cost, to see how much operator the gain actually needs
@@ -40,7 +44,7 @@ from utils import build_test_data_loader, clip_classifier
 
 def get_args():
     p = argparse.ArgumentParser(description="Prompt-operator pipeline.")
-    p.add_argument("command", choices=["fit", "classify", "all", "sweep", "residual"])
+    p.add_argument("command", choices=["fit", "classify", "all", "sweep", "residual", "oracle"])
     p.add_argument("--fit-datasets", type=str, default="imagenet",
                    help="Slash-separated corpus for fitting, e.g. 'imagenet/sun397'.")
     p.add_argument("--target", type=str, default="oxford_pets",
@@ -68,6 +72,9 @@ def get_args():
                    default=12,
                    help="Pseudo-domains carved from class names for the residual "
                         "structure test.")
+    p.add_argument("--oracle-steps", dest="oracle_steps", type=int, default=400,
+                   help="Adam steps for the best-W ceiling.")
+    p.add_argument("--oracle-lr", dest="oracle_lr", type=float, default=0.05)
     p.add_argument("--weight-mode", dest="weight_mode", type=str,
                    default="value", choices=["value", "signal"],
                    help="value: pseudo-labels from the full embedding, averaged "
@@ -109,6 +116,107 @@ def set_seed(seed):
 
 def banner(title):
     print(f"\n{'=' * 74}\n{title}\n{'=' * 74}")
+
+
+def run_oracle(args, clip_model, logit_scale, m_fit, z_fit, m_tgt, z_tgt,
+               preprocess, results):
+    """Measure the ceiling of prompt reweighting using labels as a ruler.
+
+    Produces the map that decides whether better weight estimation is worth
+    pursuing at all: MPE floor, CARPRT, the label-oracle in Eq. 10's own form,
+    and the ceiling of the whole (P, C) weight family.
+    """
+    from promptop import oracle as oracle_mod
+
+    banner(f"downstream zero-shot: {args.target}")
+    loader, classnames, _ = build_test_data_loader(
+        args.target, args.data_root, preprocess)
+    print("  encoding images once ...")
+    img_f, targets = infer_mod.encode_images(loader, clip_model)
+    tf_true = clip_classifier(classnames, TEMPLATES, clip_model)
+    n, p, c = img_f.shape[0], len(TEMPLATES), len(classnames)
+
+    gb = oracle_mod.estimate_bytes(n, p, c)
+    print(f"  similarity tensor (N,P,C) = ({n},{p},{c}) ~ {gb:.2f} GB")
+    if gb > 4.0:
+        raise SystemExit(
+            f"similarity tensor needs {gb:.1f} GB. The oracle is only practical "
+            f"for fine-grained sets; use a smaller target than {args.target}.")
+
+    banner("ceilings for prompt reweighting")
+    sim = oracle_mod.similarity_tensor(img_f, tf_true, args.chunk)
+
+    rows = []
+    uniform = torch.full((p, c), 1.0 / p, device=sim.device)
+    rows.append({"key": "mpe", "name": "MPE (uniform weights)", "labels": "no",
+                 "acc": oracle_mod._accuracy(sim, uniform, targets)})
+
+    w_carprt = infer_mod.carprt_weights(img_f, tf_true, args.temp, args.chunk)
+    _, w_raw_carprt = infer_mod.carprt_weights_split_value(
+        img_f, tf_true, tf_true, args.temp, args.chunk)
+    rows.append({"key": "carprt", "name": "CARPRT (pseudo-labels, Eq. 10)",
+                 "labels": "no",
+                 "acc": oracle_mod._accuracy(sim, w_carprt, targets)})
+
+    w_o10, w_raw_o10 = oracle_mod.oracle_eq10(sim, targets, args.temp)
+    rows.append({"key": "oracle_eq10",
+                 "name": "ORACLE: Eq. 10 with true labels", "labels": "YES",
+                 "acc": oracle_mod._accuracy(sim, w_o10, targets)})
+
+    fit_i, ev_i = oracle_mod.split_indices(n, args.seed, 0.5)
+    _, full_acc, _ = oracle_mod.oracle_optimal_w(
+        sim, targets, w_raw_carprt, args.temp, args.oracle_steps, args.oracle_lr)
+    rows.append({"key": "opt_full", "labels": "YES",
+                 "name": "ORACLE: best W (fit on all 100%)", "acc": full_acc})
+
+    _, fit_half, held = oracle_mod.oracle_optimal_w(
+        sim[fit_i], targets[fit_i], w_raw_carprt, args.temp,
+        args.oracle_steps, args.oracle_lr,
+        eval_sim=sim[ev_i], eval_targets=targets[ev_i])
+    rows.append({"key": "opt_split", "labels": "YES",
+                 "name": "ORACLE: best W (fit 50%, scored on held-out 50%)",
+                 "acc": held})
+    print(f"  [best-W: {p * c:,} free parameters. Fit on all {n:,} images it "
+          f"reaches {full_acc:.2f}, but on the 50% split it fits {fit_half:.2f}\n"
+          f"   and generalises to {held:.2f} -- the full-fit number is inflated by "
+          f"overparameterization,\n   so the held-out row is the one that means "
+          f"anything.]")
+
+    print()
+    oracle_mod.print_ceiling_table(rows)
+
+    carprt = next(r["acc"] for r in rows if r["key"] == "carprt")
+    fam = next(r["acc"] for r in rows if r["key"] == "opt_full")
+    gen = next(r["acc"] for r in rows if r["key"] == "opt_split")
+    o10 = next(r["acc"] for r in rows if r["key"] == "oracle_eq10")
+
+    print(f"\n  headroom to the family ceiling (full fit): {fam - carprt:+.2f}")
+    print(f"  headroom that actually generalises (held-out): {gen - carprt:+.2f}")
+    print(f"  attributable to pseudo-label noise (Eq. 10 form): {o10 - carprt:+.2f}")
+
+    # oracle_eq10 is the only well-posed row: closed form, no fitting, so it
+    # neither inflates (like the full fit) nor deflates (like the overparameterized
+    # split). It is also a member of the weight family, hence a valid lower bound
+    # on the family ceiling. Take the best evidence of reachable headroom.
+    gen = max(gen, o10)
+    if gen - carprt < 1.0:
+        verdict = (f"SATURATED: only {gen - carprt:+.2f} points are reachable by any "
+                   f"(P,C) weighting scheme that generalises. Better weight "
+                   f"estimation is not where the remaining accuracy is -- further "
+                   f"gains require leaving the weighting family.")
+    elif gen - carprt < 3.0:
+        verdict = (f"MODEST ROOM: {gen - carprt:+.2f} points available to a perfect "
+                   f"label-free estimator. Worth pursuing only if a large fraction "
+                   f"can be captured across several datasets.")
+    else:
+        verdict = (f"SUBSTANTIAL ROOM: {gen - carprt:+.2f} points are reachable "
+                   f"within the existing weight family. Better estimation is a "
+                   f"live research direction.")
+    print(f"\n  >>> {verdict}")
+
+    results["oracle"] = rows
+    results["oracle_verdict"] = verdict
+    return results
 
 
 def run_residual(args, clip_model, logit_scale, m_fit, z_fit, m_tgt, z_tgt,
@@ -382,8 +490,9 @@ def main():
     print(f"  M_fit {tuple(m_fit.shape)}  Z_fit {tuple(z_fit.shape)}")
     print(f"  M_tgt {tuple(m_tgt.shape)}  Z_tgt {tuple(z_tgt.shape)}")
 
-    if args.command in ("sweep", "residual"):
-        runner = run_sweep if args.command == "sweep" else run_residual
+    if args.command in ("sweep", "residual", "oracle"):
+        runner = {"sweep": run_sweep, "residual": run_residual,
+                  "oracle": run_oracle}[args.command]
         runner(args, clip_model, logit_scale, m_fit, z_fit, m_tgt, z_tgt,
                preprocess, results)
         print(f"\ndone in {time.time() - t0:.1f}s")
