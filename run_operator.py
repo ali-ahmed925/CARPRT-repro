@@ -68,6 +68,16 @@ def get_args():
                    default=12,
                    help="Pseudo-domains carved from class names for the residual "
                         "structure test.")
+    p.add_argument("--weight-mode", dest="weight_mode", type=str,
+                   default="value", choices=["value", "signal"],
+                   help="value: pseudo-labels from the full embedding, averaged "
+                        "magnitude from the residual (recommended). signal: "
+                        "replace the whole weight-estimation tensor (destroys "
+                        "pseudo-labels; kept for comparison).")
+    p.add_argument("--value-scale", dest="value_scale", type=str,
+                   default="match", choices=["match", "none"],
+                   help="match: rescale w' to the baseline per-class spread so "
+                        "alpha does not silently change the softmax temperature.")
     p.add_argument("--alpha-sweep", dest="alpha_sweep", type=str,
                    default="0,0.25,0.5,0.75,0.9,1.0,1.25,1.5",
                    help="Alphas for the residual command. 0 = plain CARPRT.")
@@ -147,17 +157,39 @@ def run_residual(args, clip_model, logit_scale, m_fit, z_fit, m_tgt, z_tgt,
     w_base = infer_mod.carprt_weights(img_f, tf_true, args.temp, args.chunk)
     print(f"  baseline CARPRT (alpha=0 anchor): {base['carprt']:.2f}")
 
+    # Reference spread for --value-scale match: the baseline's own w' at alpha=0.
+    _, w_raw_base = infer_mod.carprt_weights_split_value(
+        img_f, tf_true, tf_true, args.temp, args.chunk)
+
     alphas = [float(a) for a in args.alpha_sweep.split(",") if a]
-    banner("alpha sweep: weights from residual, scoring with true embeddings")
+    if args.weight_mode == "value":
+        banner("alpha sweep [value mode]: pseudo-labels from the full embedding, "
+               "averaged magnitude from z - alpha*T m")
+    else:
+        banner("alpha sweep [signal mode]: the whole weight-estimation tensor is "
+               "replaced (this destroys pseudo-labels; kept for comparison)")
+
     rows = []
     for a in alphas:
-        sig = fit_mod.residual_signal(z_tgt, tm_raw, a)
-        sig_tf = infer_mod.to_text_feature(sig, logit_scale, clip_model.dtype)
-        rep, _ = infer_mod.accuracy_split_signal(
-            img_f, targets, tf_true, sig_tf, args.temp, args.chunk,
-            f"alpha={a:g}", baseline_weights=w_base)
+        if args.weight_mode == "value":
+            # Magnitude signal: NOT renormalized, since ||z - a*Tm|| shrinking
+            # with alpha is part of what the estimator should see. --value-scale
+            # match then corrects the induced temperature change.
+            val_tf = infer_mod.to_text_feature(
+                z_tgt - a * tm_raw, logit_scale, clip_model.dtype, normalize=False)
+            rep, _, _ = infer_mod.accuracy_split_value(
+                img_f, targets, tf_true, val_tf, args.temp, args.chunk,
+                f"alpha={a:g}", ref_w_raw=w_raw_base,
+                value_scale=args.value_scale, baseline_weights=w_base)
+            del val_tf
+        else:
+            sig = fit_mod.residual_signal(z_tgt, tm_raw, a)
+            sig_tf = infer_mod.to_text_feature(sig, logit_scale, clip_model.dtype)
+            rep, _ = infer_mod.accuracy_split_signal(
+                img_f, targets, tf_true, sig_tf, args.temp, args.chunk,
+                f"alpha={a:g}", baseline_weights=w_base)
+            del sig, sig_tf
         rows.append({"alpha": a, **rep})
-        del sig, sig_tf
         torch.cuda.empty_cache()
 
     hdr = (f"\n{'alpha':>7}{'CARPRT':>10}{'vs baseline':>13}"
@@ -188,6 +220,8 @@ def run_residual(args, clip_model, logit_scale, m_fit, z_fit, m_tgt, z_tgt,
                    f"The interaction term is a better basis for weight estimation.")
     print(f"  >>> {verdict}")
 
+    results["weight_mode"] = args.weight_mode
+    results["value_scale"] = args.value_scale
     results["residual_alpha_sweep"] = rows
     results["residual_baseline"] = base
     results["residual_verdict"] = verdict

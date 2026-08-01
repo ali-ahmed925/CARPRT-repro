@@ -38,7 +38,15 @@ from .manifold import (
     synthesize_operators,
     interpolate_operators,
 )
-from .infer import to_text_feature, encode_images, carprt_weights, accuracy_report
+from .infer import (
+    to_text_feature,
+    encode_images,
+    carprt_weights,
+    carprt_weights_split_value,
+    accuracy_report,
+    accuracy_split_value,
+    accuracy_split_signal,
+)
 
 __all__ = [
     "ClassCorpus", "build_corpus",
@@ -49,5 +57,7 @@ __all__ = [
     "reconstruction_report", "operator_manifold_report", "residual_report",
     "structure_report",
     "operator_pca", "synthesize_operators", "interpolate_operators",
-    "to_text_feature", "encode_images", "carprt_weights", "accuracy_report",
+    "to_text_feature", "encode_images", "carprt_weights",
+    "carprt_weights_split_value", "accuracy_report",
+    "accuracy_split_value", "accuracy_split_signal",
 ]

@@ -31,13 +31,19 @@ def to_text_feature(
     z: torch.Tensor,
     logit_scale: float,
     dtype: torch.dtype = torch.float16,
+    normalize: bool = True,
 ) -> torch.Tensor:
-    """(P, C, D) unit-norm float32  ->  drop-in replacement for clip_classifier.
+    """(P, C, D) float32  ->  drop-in replacement for clip_classifier.
 
     Re-applies the logit_scale that promptop strips for the geometry, so the result
     is bit-compatible in convention with utils.clip_classifier's output.
+
+    normalize=False keeps the input magnitude, which matters when the tensor is a
+    *value* signal rather than a direction: ||z - a*Tm|| shrinks with alpha, and
+    that shrinkage is part of what the estimator is meant to see.
     """
-    z = z / z.norm(dim=-1, keepdim=True)
+    if normalize:
+        z = z / z.norm(dim=-1, keepdim=True)
     return (z * logit_scale).to(dtype).cuda()
 
 
@@ -123,6 +129,92 @@ def accuracy_report(
         "weight_entropy_frac": float(ent.mean() / torch.log(torch.tensor(float(p)))),
         "across_class_std_over_uniform": float(w.std(dim=1).mean() * p),
     }
+
+
+@torch.no_grad()
+def carprt_weights_split_value(
+    image_features: torch.Tensor,
+    score_feature: torch.Tensor,
+    value_feature: torch.Tensor,
+    temp: float = 1.0,
+    chunk: int = 512,
+    ref_w_raw: torch.Tensor = None,
+    value_scale: str = "none",
+):
+    """Eq. 10 with the pseudo-label and the averaged magnitude taken apart.
+
+        yhat_{j,i} = argmax_c <z_I, score_feature[i,c]>     (class identity)
+        w'_{i,c}   = mean over {j : yhat = c} of <z_I, value_feature[i,c]>
+
+    Only the averaged quantity changes; the indicator, the counts, the softmax
+    axis and the scoring path are untouched. value_feature == score_feature
+    reproduces CARPRT exactly.
+
+    value_scale="match" rescales w' so its per-class spread across prompts equals
+    ref_w_raw's before the softmax. Without it, a value signal of smaller
+    magnitude silently acts as a larger temperature and flattens the weights --
+    which would look like the signal failing when only the sharpness changed.
+    Softmax is shift-invariant along the prompt axis, so centring is free.
+
+    Returns (weights (P, C), w_raw (P, C)).
+    """
+    p, c, _ = score_feature.shape
+    device = score_feature.device
+    w_sum = torch.zeros((p, c), dtype=torch.float32, device=device)
+    w_cnt = torch.zeros((p, c), dtype=torch.long, device=device)
+
+    for i in range(0, image_features.shape[0], chunk):
+        imgs = image_features[i:i + chunk]
+        idx = torch.einsum("pcd,nd -> pcn", score_feature, imgs).argmax(dim=1)
+        lv = torch.einsum("pcd,nd -> pcn", value_feature, imgs)
+        val = lv.gather(1, idx.unsqueeze(1)).squeeze(1).float()        # (P, n)
+        del lv
+        w_sum.scatter_add_(1, idx, val)
+        w_cnt.scatter_add_(1, idx, torch.ones_like(val, dtype=torch.long))
+
+    w_raw = w_sum / torch.where(w_cnt == 0, 1, w_cnt)
+
+    if value_scale == "match" and ref_w_raw is not None:
+        cur = w_raw.std(dim=0, keepdim=True).clamp_min(1e-8)
+        ref = ref_w_raw.std(dim=0, keepdim=True)
+        w_raw = (w_raw - w_raw.mean(dim=0, keepdim=True)) * (ref / cur)
+
+    return F.softmax(w_raw / temp, dim=0), w_raw
+
+
+@torch.no_grad()
+def accuracy_split_value(
+    image_features: torch.Tensor,
+    targets: torch.Tensor,
+    score_feature: torch.Tensor,
+    value_feature: torch.Tensor,
+    temp: float = 1.0,
+    chunk: int = 512,
+    name: str = "split-value",
+    ref_w_raw: torch.Tensor = None,
+    value_scale: str = "none",
+    baseline_weights: torch.Tensor = None,
+):
+    """Weights from the split estimator, classification with score_feature."""
+    w, w_raw = carprt_weights_split_value(
+        image_features, score_feature, value_feature, temp, chunk,
+        ref_w_raw, value_scale)
+    logits = _scores(image_features, score_feature, w)
+
+    p = w.shape[0]
+    ent = -(w * w.clamp_min(1e-12).log()).sum(dim=0)
+    out = {
+        "name": name,
+        "carprt": _micro(logits, targets),
+        "weight_entropy_frac": float(ent.mean() / torch.log(torch.tensor(float(p)))),
+        "across_class_std_over_uniform": float(w.std(dim=1).mean() * p),
+    }
+    if baseline_weights is not None:
+        a = (w - w.mean()).flatten()
+        b = (baseline_weights - baseline_weights.mean()).flatten()
+        out["corr_with_baseline_w"] = float(
+            (a * b).sum() / (a.norm() * b.norm()).clamp_min(1e-12))
+    return out, w, w_raw
 
 
 @torch.no_grad()
