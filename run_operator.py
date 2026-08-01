@@ -235,7 +235,11 @@ def run_validate(args, clip_model, logit_scale, m_fit, z_fit, m_tgt, z_tgt,
         wins = sum(1 for d in deltas if d > 0)
         print(f"\n  mean delta {mean_d:+.2f} over {len(rows)} datasets, "
               f"positive on {wins}/{len(rows)}")
-        if len(rows) >= 3 and wins == len(rows):
+        if len(rows) < 3:
+            v = (f"INCONCLUSIVE: only {len(rows)} dataset(s). Consistency cannot "
+                 f"be assessed, and alpha was selected on Pets -- this number is "
+                 f"not yet evidence of anything. Run at least 3 unseen datasets.")
+        elif wins == len(rows):
             v = ("CONSISTENT: positive on every dataset. This is a finding, not "
                  "a selection artifact.")
         elif mean_d > 0 and wins > len(rows) / 2:
