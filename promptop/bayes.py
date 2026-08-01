@@ -304,20 +304,50 @@ def count_power_scores(
     s2: torch.Tensor,
     n: torch.Tensor,
     alpha: float = 0.5,
-    empty: str = "floor",
+    empty: str = "carprt",
 ) -> torch.Tensor:
-    """score = (mu - mu_bar) * n^alpha.
+    """score = mu_bar + (mu - mu_bar) * n^alpha, renormalised so alpha=0 is EXACT.
 
-    A one-parameter family containing CARPRT at alpha = 0. n_{i,c} counts how
-    often prompt i selects class c across the unlabeled set -- evidence of
-    affinity that Eq. 10 discards, since it averages the winning similarities and
-    never asks how many there were. alpha = 0.5 recovers the count factor of the
-    t-statistic, which the decomposition showed is the part that helps (the
-    dispersion factor 1/sd hurts and is deliberately absent here).
+    A one-parameter family whose alpha=0 member reproduces CARPRT's weights
+    bit-for-bit. n_{i,c} counts how often prompt i selects class c across the
+    unlabeled set -- evidence of affinity that Eq. 10 discards, since it averages
+    the winning similarities and never asks how many there were. The dispersion
+    factor 1/sd is deliberately absent: the decomposition showed it hurts on every
+    dataset tested.
+
+    Getting the alpha=0 anchor exact requires care on two cell types, and the
+    earlier "floor" convention got both wrong:
+
+      n == 0 : no value at all. CARPRT leaves mu = 0, which sits ~mu_bar below the
+               class mean and yields negligible weight. Reproduced exactly by
+               writing 0 into the score and excluding these cells from the
+               normaliser -- flooring them at min - 10*ref_sd instead drifted the
+               alpha=0 row up to +1.89 over CARPRT on sparse class subsets.
+      n == 1 : no variance estimate, but a perfectly good value, which CARPRT
+               uses. This family needs only the count, so such cells are ordinary
+               members; forcing them to the class mean was gratuitous.
+
+    The deviation is rescaled to its own alpha=0 spread over cells with n >= 1, so
+    a fixed tau means the same thing at every alpha and no alpha wins by sharpness.
+    At alpha=0 that factor is exactly 1.
     """
-    _, _, dev, _, est = _deviation(s1, s2, n)
+    mu, _, _ = cell_statistics(s1, s2, n)
+    est = n >= 1                          # a count of 1 still carries a value
+    cnt = est.sum(dim=0, keepdim=True).clamp_min(1).float()
+    mu_bar = torch.where(est, mu, torch.zeros_like(mu)).sum(dim=0, keepdim=True) / cnt
+    dev = torch.where(est, mu - mu_bar, torch.zeros_like(mu))
+
     v = dev * n.float().clamp_min(1.0).pow(alpha)
-    return _rescale_and_floor(v, dev, est, n, empty)
+    v = torch.where(est, v, torch.zeros_like(v))
+
+    ref = dev.std(dim=0, keepdim=True).clamp_min(1e-8)
+    v = v / v.std(dim=0, keepdim=True).clamp_min(1e-8) * ref      # == 1 at alpha=0
+
+    scores = mu_bar + v
+    if empty == "carprt":
+        # exactly what Eq. 10 produces for an unvisited cell
+        scores = torch.where(n == 0, torch.zeros_like(scores), scores)
+    return scores
 
 
 def score_variants(
