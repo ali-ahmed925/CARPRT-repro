@@ -11,6 +11,10 @@
               MPE floor, CARPRT, Eq. 10 with true labels, and the best possible
               (P, C) weight matrix -- with a held-out split so the ceiling is
               one a real estimator could actually generalise to
+    characterize  compare the oracle weight matrix with CARPRT's: descriptive
+              stats, whether the missing accuracy is class-agnostic or
+              class-specific, and which accumulated statistic best predicts the
+              oracle (which forecasts whether a new estimator will work)
     sweep     model-complexity ladder: identity / additive / affine / low-rank at
               several ranks / full ridge / Procrustes, each scored against its
               parameter cost, to see how much operator the gain actually needs
@@ -44,7 +48,8 @@ from utils import build_test_data_loader, clip_classifier
 
 def get_args():
     p = argparse.ArgumentParser(description="Prompt-operator pipeline.")
-    p.add_argument("command", choices=["fit", "classify", "all", "sweep", "residual", "oracle"])
+    p.add_argument("command", choices=["fit", "classify", "all", "sweep", "residual", "oracle",
+                            "characterize"])
     p.add_argument("--fit-datasets", type=str, default="imagenet",
                    help="Slash-separated corpus for fitting, e.g. 'imagenet/sun397'.")
     p.add_argument("--target", type=str, default="oxford_pets",
@@ -116,6 +121,90 @@ def set_seed(seed):
 
 def banner(title):
     print(f"\n{'=' * 74}\n{title}\n{'=' * 74}")
+
+
+def run_characterize(args, clip_model, logit_scale, m_fit, z_fit, m_tgt, z_tgt,
+                     preprocess, results):
+    """Compare the oracle weight matrix with CARPRT's and diagnose the gap."""
+    from promptop import oracle as oracle_mod
+    from promptop import characterize as ch
+
+    banner(f"downstream zero-shot: {args.target}")
+    loader, classnames, _ = build_test_data_loader(
+        args.target, args.data_root, preprocess)
+    print("  encoding images once ...")
+    img_f, targets = infer_mod.encode_images(loader, clip_model)
+    tf_true = clip_classifier(classnames, TEMPLATES, clip_model)
+    n, p, c = img_f.shape[0], len(TEMPLATES), len(classnames)
+
+    gb = oracle_mod.estimate_bytes(n, p, c)
+    if gb > 4.0:
+        raise SystemExit(f"similarity tensor needs {gb:.1f} GB; target too large.")
+    sim = oracle_mod.similarity_tensor(img_f, tf_true, args.chunk)
+
+    w_carprt = infer_mod.carprt_weights(img_f, tf_true, args.temp, args.chunk)
+    _, theta_carprt = infer_mod.carprt_weights_split_value(
+        img_f, tf_true, tf_true, args.temp, args.chunk)
+    w_oracle, orc_acc, _ = oracle_mod.oracle_optimal_w(
+        sim, targets, theta_carprt, args.temp, args.oracle_steps, args.oracle_lr)
+    base_acc = oracle_mod._accuracy(sim, w_carprt, targets)
+    print(f"  CARPRT {base_acc:.2f}   oracle(best W, full fit) {orc_acc:.2f}")
+
+    banner("1. how do the two weight matrices differ?")
+    ch.print_stats_table([ch.weight_stats(w_carprt, "CARPRT"),
+                          ch.weight_stats(w_oracle, "oracle (best W)")])
+    agree = ch.compare_pair(w_carprt, w_oracle)
+    print(f"\n  agreement: pearson {agree['pearson']:.4f}   "
+          f"per-class spearman {agree['spearman_per_class']:.4f}")
+    print()
+    up, down = ch.top_movers(w_oracle, w_carprt, TEMPLATES)
+    ch.print_movers(up, down)
+
+    banner("2. is the missing accuracy class-agnostic or class-specific?")
+    dec = ch.decompose_gap(sim, targets, theta_carprt, w_oracle, args.temp)
+    meta = next(r for r in dec if r["name"] == "__meta__")
+    rows = [r for r in dec if r["name"] != "__meta__"]
+    hdr = f"{'correction applied':<34}{'accuracy':>10}{'recovered':>12}"
+    print(hdr)
+    print("-" * len(hdr))
+    total = rows[-1]["acc"] - rows[0]["acc"]
+    for r in rows:
+        got = r["acc"] - rows[0]["acc"]
+        frac = "" if total <= 0 else f"{100 * got / total:.0f}%"
+        print(f"{r['name']:<34}{r['acc']:>10.2f}{frac:>12}")
+    print(f"\n  class-agnostic share of the correction's energy: "
+          f"{100 * meta['class_agnostic_energy_frac']:.1f}%")
+
+    banner("3. which statistic should Eq. 10 accumulate?")
+    stats = ch.candidate_statistics(sim, args.chunk)
+    align = ch.statistic_alignment(stats, w_oracle, sim, targets, args.temp)
+    hdr = (f"{'accumulated quantity':<20}{'spearman vs oracle':>20}"
+           f"{'pearson':>10}{'accuracy':>11}{'vs CARPRT':>12}")
+    print(hdr)
+    print("-" * len(hdr))
+    for r in align:
+        tag = "  <- CARPRT's rule" if r["name"] == "similarity" else ""
+        print(f"{r['name']:<20}{r['spearman_vs_oracle']:>20.4f}"
+              f"{r['pearson_vs_oracle']:>10.4f}{r['acc']:>11.2f}"
+              f"{r['acc'] - base_acc:>+12.2f}{tag}")
+
+    best = align[0]
+    if best["name"] != "similarity" and best["acc"] > base_acc:
+        print(f"\n  >>> '{best['name']}' already beats CARPRT by "
+              f"{best['acc'] - base_acc:+.2f} as a drop-in accumulation rule.")
+    else:
+        print("\n  >>> no candidate rule beats the raw similarity; the gap is not "
+              "a matter of\n      swapping the accumulated statistic.")
+
+    results["characterize"] = {
+        "carprt": base_acc, "oracle": orc_acc, "agreement": agree,
+        "decomposition": rows, "class_agnostic_frac":
+            meta["class_agnostic_energy_frac"], "statistics": align,
+        "stats_table": [ch.weight_stats(w_carprt, "CARPRT"),
+                        ch.weight_stats(w_oracle, "oracle")],
+        "top_up": up, "top_down": down,
+    }
+    return results
 
 
 def run_oracle(args, clip_model, logit_scale, m_fit, z_fit, m_tgt, z_tgt,
@@ -490,9 +579,10 @@ def main():
     print(f"  M_fit {tuple(m_fit.shape)}  Z_fit {tuple(z_fit.shape)}")
     print(f"  M_tgt {tuple(m_tgt.shape)}  Z_tgt {tuple(z_tgt.shape)}")
 
-    if args.command in ("sweep", "residual", "oracle"):
+    if args.command in ("sweep", "residual", "oracle", "characterize"):
         runner = {"sweep": run_sweep, "residual": run_residual,
-                  "oracle": run_oracle}[args.command]
+                  "oracle": run_oracle,
+                  "characterize": run_characterize}[args.command]
         runner(args, clip_model, logit_scale, m_fit, z_fit, m_tgt, z_tgt,
                preprocess, results)
         print(f"\ndone in {time.time() - t0:.1f}s")
