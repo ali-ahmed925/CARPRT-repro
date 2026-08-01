@@ -125,6 +125,44 @@ def accuracy_report(
     }
 
 
+@torch.no_grad()
+def accuracy_split_signal(
+    image_features: torch.Tensor,
+    targets: torch.Tensor,
+    score_feature: torch.Tensor,
+    weight_feature: torch.Tensor,
+    temp: float = 1.0,
+    chunk: int = 512,
+    name: str = "split",
+    baseline_weights: torch.Tensor = None,
+) -> Dict[str, object]:
+    """Estimate prompt weights from one signal, classify with another.
+
+    CARPRT uses a single similarity for two jobs: deciding which prompt suits
+    which class, and scoring the image. Those jobs want different things -- class
+    content helps the second and distracts the first. This splits them, so the
+    weights can come from the interaction term while scoring keeps the full
+    embedding. weight_feature == score_feature recovers ordinary CARPRT.
+    """
+    w = carprt_weights(image_features, weight_feature, temp, chunk)
+    logits = _scores(image_features, score_feature, w)
+
+    p = w.shape[0]
+    ent = -(w * w.clamp_min(1e-12).log()).sum(dim=0)
+    out = {
+        "name": name,
+        "carprt": _micro(logits, targets),
+        "weight_entropy_frac": float(ent.mean() / torch.log(torch.tensor(float(p)))),
+        "across_class_std_over_uniform": float(w.std(dim=1).mean() * p),
+    }
+    if baseline_weights is not None:
+        a = (w - w.mean()).flatten()
+        b = (baseline_weights - baseline_weights.mean()).flatten()
+        out["corr_with_baseline_w"] = float(
+            (a * b).sum() / (a.norm() * b.norm()).clamp_min(1e-12))
+    return out, w
+
+
 def print_accuracy_table(rows) -> None:
     hdr = (f"{'text features':<30}{'CARPRT':>9}{'MPE':>9}{'gain':>8}"
            f"{'H(W)/Hmax':>11}{'cls-std':>9}")

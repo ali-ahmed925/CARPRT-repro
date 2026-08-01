@@ -206,6 +206,32 @@ def predict(m_target: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
     return z / z.norm(dim=-1, keepdim=True)
 
 
+def predict_raw(m_target: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    """T_i m_c without renormalization -- the model's actual prediction.
+
+    Required for residual work: R = z - T m is only meaningful against the
+    unnormalized prediction, since that is what least squares fitted.
+    """
+    return torch.einsum("cd,pde->pce", m_target, w)
+
+
+def residual_signal(
+    z_true: torch.Tensor,
+    tm_raw: torch.Tensor,
+    alpha: float = 1.0,
+) -> torch.Tensor:
+    """Unit-norm (P, C, D) signal with the transferable component removed.
+
+        z^(alpha) = normalize(z - alpha * T m)
+
+    alpha=0 returns z unchanged (so downstream results reproduce CARPRT exactly);
+    alpha=1 is the pure interaction term. Renormalizing keeps the similarity scale
+    comparable across alpha, so a fixed temperature keeps meaning the same thing.
+    """
+    z = z_true - alpha * tm_raw
+    return z / z.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+
+
 def predict_identity(m_target: torch.Tensor, n_prompts: int) -> torch.Tensor:
     """Null: ignore the prompt entirely, use the bare class name."""
     z = m_target.unsqueeze(0).expand(n_prompts, -1, -1).contiguous()

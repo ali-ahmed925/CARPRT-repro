@@ -113,7 +113,10 @@ def load_or_build(
     path = os.path.join(cache_dir, f"embeddings_{key}.pt")
 
     if os.path.exists(path) and not force:
-        blob = torch.load(path, map_location="cpu")
+        # Explicit: the cache stores python lists of class names alongside the
+        # tensors, so weights_only=True cannot load it. torch 2.6 flips this
+        # default, which would break the cache silently.
+        blob = torch.load(path, map_location="cpu", weights_only=False)
         print(f"  loaded cached embeddings: {path}")
         return blob["M"].float(), blob["Z"].float()
 

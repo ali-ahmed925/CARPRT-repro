@@ -5,6 +5,8 @@
     classify  zero-shot accuracy on a target dataset using ONLY synthesized
               prompt embeddings (C text encodings instead of P*C)
     all       both, sharing one encode
+    residual  estimate prompt weights from the interaction term z - alpha*T m,
+              score with the TRUE embeddings; alpha=0 reproduces CARPRT exactly
     sweep     model-complexity ladder: identity / additive / affine / low-rank at
               several ranks / full ridge / Procrustes, each scored against its
               parameter cost, to see how much operator the gain actually needs
@@ -38,7 +40,7 @@ from utils import build_test_data_loader, clip_classifier
 
 def get_args():
     p = argparse.ArgumentParser(description="Prompt-operator pipeline.")
-    p.add_argument("command", choices=["fit", "classify", "all", "sweep"])
+    p.add_argument("command", choices=["fit", "classify", "all", "sweep", "residual"])
     p.add_argument("--fit-datasets", type=str, default="imagenet",
                    help="Slash-separated corpus for fitting, e.g. 'imagenet/sun397'.")
     p.add_argument("--target", type=str, default="oxford_pets",
@@ -66,6 +68,9 @@ def get_args():
                    default=12,
                    help="Pseudo-domains carved from class names for the residual "
                         "structure test.")
+    p.add_argument("--alpha-sweep", dest="alpha_sweep", type=str,
+                   default="0,0.25,0.5,0.75,0.9,1.0,1.25,1.5",
+                   help="Alphas for the residual command. 0 = plain CARPRT.")
     p.add_argument("--rank-sweep", dest="rank_sweep", type=str,
                    default="1,2,4,8,16,64",
                    help="Comma-separated ranks for the sweep command.")
@@ -94,6 +99,99 @@ def set_seed(seed):
 
 def banner(title):
     print(f"\n{'=' * 74}\n{title}\n{'=' * 74}")
+
+
+def run_residual(args, clip_model, logit_scale, m_fit, z_fit, m_tgt, z_tgt,
+                 preprocess, results):
+    """Estimate prompt weights from the interaction term, score with true embeddings.
+
+    Nothing is synthesized here: all P*C real prompted embeddings are used for
+    scoring, unchanged. The only thing that varies is the signal the weights are
+    estimated from,
+
+        z^(alpha) = normalize(z - alpha * T m),
+
+    so alpha=0 IS ordinary CARPRT and the sweep starts from its accuracy by
+    construction. If the curve rises above alpha=0, removing the transferable
+    component sharpened the weight estimate.
+    """
+    banner(f"operator fit ({args.estimator}) for the transferable component")
+    lam = args.lam if args.lam is not None else fit_mod.auto_lambda(m_fit)
+    if args.estimator == "procrustes":
+        w_op = fit_mod.fit_procrustes(m_fit, z_fit)
+    elif args.estimator == "lowrank":
+        w_op = fit_mod.fit_lowrank(m_fit, z_fit, args.rank, lam)
+    else:
+        w_op = fit_mod.fit_ridge_identity(m_fit, z_fit, lam)
+    print(f"  W {tuple(w_op.shape)}  lambda {lam:.6f}")
+
+    tm_raw = fit_mod.predict_raw(m_tgt, w_op)
+    res = z_tgt - tm_raw
+    print(f"  ||z|| {z_tgt.norm(dim=-1).mean():.4f}   "
+          f"||T m|| {tm_raw.norm(dim=-1).mean():.4f}   "
+          f"||R|| {res.norm(dim=-1).mean():.4f}   "
+          f"(residual is {100 * res.norm(dim=-1).mean() / z_tgt.norm(dim=-1).mean():.1f}% "
+          f"of the embedding)")
+    del w_op
+    torch.cuda.empty_cache()
+
+    banner(f"downstream zero-shot: {args.target}")
+    loader, classnames, _ = build_test_data_loader(
+        args.target, args.data_root, preprocess)
+    print("  encoding images once ...")
+    img_f, targets = infer_mod.encode_images(loader, clip_model)
+    tf_true = clip_classifier(classnames, TEMPLATES, clip_model)
+
+    base = infer_mod.accuracy_report(img_f, targets, tf_true, args.temp,
+                                     args.chunk, "baseline CARPRT")
+    w_base = infer_mod.carprt_weights(img_f, tf_true, args.temp, args.chunk)
+    print(f"  baseline CARPRT (alpha=0 anchor): {base['carprt']:.2f}")
+
+    alphas = [float(a) for a in args.alpha_sweep.split(",") if a]
+    banner("alpha sweep: weights from residual, scoring with true embeddings")
+    rows = []
+    for a in alphas:
+        sig = fit_mod.residual_signal(z_tgt, tm_raw, a)
+        sig_tf = infer_mod.to_text_feature(sig, logit_scale, clip_model.dtype)
+        rep, _ = infer_mod.accuracy_split_signal(
+            img_f, targets, tf_true, sig_tf, args.temp, args.chunk,
+            f"alpha={a:g}", baseline_weights=w_base)
+        rows.append({"alpha": a, **rep})
+        del sig, sig_tf
+        torch.cuda.empty_cache()
+
+    hdr = (f"\n{'alpha':>7}{'CARPRT':>10}{'vs baseline':>13}"
+           f"{'H(W)/Hmax':>12}{'cls-std':>10}{'corr w/ base W':>16}")
+    print(hdr)
+    print("-" * len(hdr.strip()))
+    for r in rows:
+        print(f"{r['alpha']:>7.2f}{r['carprt']:>10.2f}"
+              f"{r['carprt'] - base['carprt']:>+13.2f}"
+              f"{r['weight_entropy_frac']:>12.3f}"
+              f"{r['across_class_std_over_uniform']:>10.3f}"
+              f"{r.get('corr_with_baseline_w', float('nan')):>16.3f}")
+
+    best = max(rows, key=lambda r: r["carprt"])
+    delta = best["carprt"] - base["carprt"]
+    print(f"\n  baseline (alpha=0): {base['carprt']:.2f}")
+    print(f"  best: alpha={best['alpha']:g} at {best['carprt']:.2f} ({delta:+.2f})")
+    if best["alpha"] == 0.0 or delta <= 0.0:
+        verdict = ("NO GAIN: removing the transferable component does not improve "
+                   "the weight estimate. The nuisance-projection hypothesis fails "
+                   "on this dataset.")
+    elif delta < 0.6:
+        verdict = (f"MARGINAL: {delta:+.2f} points is ~{delta * 36.69:.0f} images of "
+                   f"3669, inside one standard error. Suggestive, not conclusive -- "
+                   f"needs more datasets before it means anything.")
+    else:
+        verdict = (f"GAIN: {delta:+.2f} points over CARPRT with identical embeddings. "
+                   f"The interaction term is a better basis for weight estimation.")
+    print(f"  >>> {verdict}")
+
+    results["residual_alpha_sweep"] = rows
+    results["residual_baseline"] = base
+    results["residual_verdict"] = verdict
+    return results
 
 
 def run_sweep(args, clip_model, logit_scale, m_fit, z_fit, m_tgt, z_tgt,
@@ -250,9 +348,10 @@ def main():
     print(f"  M_fit {tuple(m_fit.shape)}  Z_fit {tuple(z_fit.shape)}")
     print(f"  M_tgt {tuple(m_tgt.shape)}  Z_tgt {tuple(z_tgt.shape)}")
 
-    if args.command == "sweep":
-        run_sweep(args, clip_model, logit_scale, m_fit, z_fit, m_tgt, z_tgt,
-                  preprocess, results)
+    if args.command in ("sweep", "residual"):
+        runner = run_sweep if args.command == "sweep" else run_residual
+        runner(args, clip_model, logit_scale, m_fit, z_fit, m_tgt, z_tgt,
+               preprocess, results)
         print(f"\ndone in {time.time() - t0:.1f}s")
         if args.out:
             with open(args.out, "w") as fh:
