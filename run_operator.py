@@ -5,6 +5,9 @@
     classify  zero-shot accuracy on a target dataset using ONLY synthesized
               prompt embeddings (C text encodings instead of P*C)
     all       both, sharing one encode
+    sweep     model-complexity ladder: identity / additive / affine / low-rank at
+              several ranks / full ridge / Procrustes, each scored against its
+              parameter cost, to see how much operator the gain actually needs
 
 Example (uses only what is already on disk -- ImageNet class names are hardcoded
 in datasets/imagenet.py, so no ImageNet images are needed):
@@ -35,7 +38,7 @@ from utils import build_test_data_loader, clip_classifier
 
 def get_args():
     p = argparse.ArgumentParser(description="Prompt-operator pipeline.")
-    p.add_argument("command", choices=["fit", "classify", "all"])
+    p.add_argument("command", choices=["fit", "classify", "all", "sweep"])
     p.add_argument("--fit-datasets", type=str, default="imagenet",
                    help="Slash-separated corpus for fitting, e.g. 'imagenet/sun397'.")
     p.add_argument("--target", type=str, default="oxford_pets",
@@ -45,7 +48,7 @@ def get_args():
     p.add_argument("--data-root", dest="data_root", type=str,
                    default=os.path.expanduser("~/datasets"))
     p.add_argument("--estimator", type=str, default="ridge",
-                   choices=["ridge", "procrustes", "lowrank"])
+                   choices=["ridge", "procrustes", "lowrank", "affine"])
     p.add_argument("--rank", type=int, default=64, help="lowrank estimator only.")
     p.add_argument("--lam", type=float, default=None,
                    help="Ridge strength; default is scale-aware (auto_lambda).")
@@ -63,6 +66,9 @@ def get_args():
                    default=12,
                    help="Pseudo-domains carved from class names for the residual "
                         "structure test.")
+    p.add_argument("--rank-sweep", dest="rank_sweep", type=str,
+                   default="1,2,4,8,16,64",
+                   help="Comma-separated ranks for the sweep command.")
     p.add_argument("--pca-components", dest="pca_components", type=int, default=20)
     p.add_argument("--synth-prompts", dest="synth_prompts", type=int, default=0,
                    help="Synthesize N novel operators from the manifold and score "
@@ -88,6 +94,103 @@ def set_seed(seed):
 
 def banner(title):
     print(f"\n{'=' * 74}\n{title}\n{'=' * 74}")
+
+
+def run_sweep(args, clip_model, logit_scale, m_fit, z_fit, m_tgt, z_tgt,
+              preprocess, results):
+    """Model-complexity ladder: how much operator does the gain actually need?
+
+    Every entry is scored on the same held-out target with the same images, and
+    reported against its parameter cost per prompt, so the marginal value of the
+    matrix over a plain additive shift is visible rather than argued about.
+    """
+    d = m_fit.shape[1]
+    p = z_fit.shape[0]
+    lam = args.lam
+
+    banner(f"downstream zero-shot: {args.target}")
+    loader, classnames, _ = build_test_data_loader(
+        args.target, args.data_root, preprocess)
+    print("  encoding images once ...")
+    img_f, targets = infer_mod.encode_images(loader, clip_model)
+
+    tf_true = clip_classifier(classnames, TEMPLATES, clip_model)
+    true_rep = infer_mod.accuracy_report(img_f, targets, tf_true, args.temp,
+                                         args.chunk, "true embeddings")
+
+    ranks = [int(r) for r in args.rank_sweep.split(",") if r]
+    plan = ([("identity", None), ("additive", None), ("affine", None)]
+            + [("lowrank", r) for r in ranks]
+            + [("ridge", None), ("procrustes", None)])
+
+    banner("model-complexity sweep")
+    rows = []
+    for kind, rank in plan:
+        if kind == "identity":
+            z_hat = fit_mod.predict_identity(m_tgt, p)
+        elif kind == "additive":
+            z_hat = fit_mod.predict_additive(m_tgt, fit_mod.fit_additive(m_fit, z_fit))
+        elif kind == "affine":
+            w = fit_mod.fit_affine(m_fit, z_fit, lam)
+            z_hat = fit_mod.predict_affine(m_tgt, w)
+            del w
+        elif kind == "lowrank":
+            w = fit_mod.fit_lowrank(m_fit, z_fit, rank, lam)
+            z_hat = fit_mod.predict(m_tgt, w)
+            del w
+        elif kind == "procrustes":
+            w = fit_mod.fit_procrustes(m_fit, z_fit)
+            z_hat = fit_mod.predict(m_tgt, w)
+            del w
+        else:
+            w = fit_mod.fit_ridge_identity(m_fit, z_fit, lam)
+            z_hat = fit_mod.predict(m_tgt, w)
+            del w
+        torch.cuda.empty_cache()
+
+        label = f"{kind} r={rank}" if rank else kind
+        rec = eval_mod.reconstruction_report(z_tgt, z_hat, label)
+        tf = infer_mod.to_text_feature(z_hat, logit_scale, clip_model.dtype)
+        acc = infer_mod.accuracy_report(img_f, targets, tf, args.temp,
+                                        args.chunk, label)
+        rows.append({"model": label, "params": fit_mod.n_params(kind, d, rank),
+                     "cos_centred": rec["cos_centred_median"],
+                     "carprt": acc["carprt"], "mpe": acc["mpe"],
+                     "gain": acc["gain"]})
+        del z_hat, tf
+        torch.cuda.empty_cache()
+        print(f"  done: {label}")
+
+    floor = next(r["carprt"] for r in rows if r["model"] == "identity")
+    hdr = (f"\n{'model':<16}{'params/prompt':>15}{'cos(centred)':>14}"
+           f"{'CARPRT':>9}{'over floor':>12}{'pts/1k par':>12}")
+    print(hdr)
+    print("-" * len(hdr.strip()))
+    for r in rows:
+        over = r["carprt"] - floor
+        eff = "-" if r["params"] == 0 else f"{1000 * over / r['params']:.4f}"
+        print(f"{r['model']:<16}{r['params']:>15,}{r['cos_centred']:>14.4f}"
+              f"{r['carprt']:>9.2f}{over:>+12.2f}{eff:>12}")
+    print(f"\n  ceiling (true embeddings): {true_rep['carprt']:.2f}  "
+          f"| floor (no prompt info): {floor:.2f}  "
+          f"| headroom: {true_rep['carprt'] - floor:+.2f}")
+
+    add = next(r for r in rows if r["model"] == "additive")
+    best_lr = [r for r in rows if r["model"].startswith("lowrank")
+               and r["carprt"] > add["carprt"]]
+    if best_lr:
+        cheapest = min(best_lr, key=lambda r: r["params"])
+        print(f"  cheapest operator beating additive: {cheapest['model']} at "
+              f"{cheapest['params']:,} params "
+              f"({cheapest['params'] / max(add['params'], 1):.1f}x additive) "
+              f"for {cheapest['carprt'] - add['carprt']:+.2f} points")
+    else:
+        print("  >>> NO low-rank operator beat the additive shift. The matrix is "
+              "not earning\n      its parameters at any rank tested.")
+
+    results["sweep"] = rows
+    results["sweep_true"] = true_rep
+    return results
 
 
 def main():
@@ -147,6 +250,16 @@ def main():
     print(f"  M_fit {tuple(m_fit.shape)}  Z_fit {tuple(z_fit.shape)}")
     print(f"  M_tgt {tuple(m_tgt.shape)}  Z_tgt {tuple(z_tgt.shape)}")
 
+    if args.command == "sweep":
+        run_sweep(args, clip_model, logit_scale, m_fit, z_fit, m_tgt, z_tgt,
+                  preprocess, results)
+        print(f"\ndone in {time.time() - t0:.1f}s")
+        if args.out:
+            with open(args.out, "w") as fh:
+                json.dump(results, fh, indent=2, default=str)
+            print(f"results -> {args.out}")
+        return
+
     # ------------------------------------------------------------------- fit
     banner(f"operator fit ({args.estimator})")
     lam = args.lam if args.lam is not None else fit_mod.auto_lambda(m_fit)
@@ -154,6 +267,8 @@ def main():
 
     if args.estimator == "ridge":
         w = fit_mod.fit_ridge_identity(m_fit, z_fit, lam)
+    elif args.estimator == "affine":
+        w = fit_mod.fit_affine(m_fit, z_fit, lam)
     elif args.estimator == "procrustes":
         w = fit_mod.fit_procrustes(m_fit, z_fit)
     else:

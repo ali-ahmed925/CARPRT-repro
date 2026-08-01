@@ -125,8 +125,15 @@ def residual_report(
     effect = z - m.unsqueeze(0)                          # total prompt effect
 
     explained = 1.0 - (resid.pow(2).sum() / effect.pow(2).sum().clamp_min(1e-12))
-    per_prompt = 1.0 - (resid.pow(2).sum(dim=(1, 2))
-                        / effect.pow(2).sum(dim=(1, 2)).clamp_min(1e-12))
+
+    # A template identical to base_template (e.g. "{}") has zero prompt effect by
+    # construction, so its explained-fraction denominator is numerical noise and
+    # the ratio explodes. Such prompts are degenerate for this statistic, not
+    # badly modelled -- exclude them rather than let one entry destroy the mean.
+    eff_energy = effect.pow(2).sum(dim=(1, 2))
+    valid = eff_energy > 1e-4 * eff_energy.median()
+    per_prompt = 1.0 - (resid.pow(2).sum(dim=(1, 2)) / eff_energy.clamp_min(1e-12))
+    pp_valid = per_prompt[valid]
 
     assign = _spherical_kmeans(m, n_clusters, seed=seed)
     rn = resid / resid.norm(dim=-1, keepdim=True).clamp_min(1e-8)
@@ -150,14 +157,16 @@ def residual_report(
     b_mean = float(torch.tensor(between).mean()) if between else float("nan")
     gap = w_mean - b_mean
 
-    order = torch.argsort(per_prompt)
+    valid_idx = valid.nonzero(as_tuple=True)[0]
+    order = valid_idx[torch.argsort(per_prompt[valid_idx])]
     worst = [(templates[i] if templates else f"prompt[{i}]", float(per_prompt[i]))
              for i in order[:5]]
 
     return {
         "explained_fraction": float(explained),
-        "per_prompt_explained_mean": float(per_prompt.mean()),
-        "per_prompt_explained_min": float(per_prompt.min()),
+        "per_prompt_explained_mean": float(pp_valid.mean()),
+        "per_prompt_explained_min": float(pp_valid.min()),
+        "n_degenerate_prompts": int((~valid).sum()),
         "residual_within_domain_cos": w_mean,
         "residual_between_domain_cos": b_mean,
         "domain_structure_gap": gap,
@@ -168,10 +177,12 @@ def residual_report(
 
 
 def print_residual_report(rep: Dict[str, object]) -> None:
+    deg = rep.get("n_degenerate_prompts", 0)
+    note = f", {deg} zero-effect prompt(s) excluded" if deg else ""
     print(f"  operator explains {100 * rep['explained_fraction']:.1f}% of the "
           f"prompt effect (per-prompt mean "
           f"{100 * rep['per_prompt_explained_mean']:.1f}%, "
-          f"min {100 * rep['per_prompt_explained_min']:.1f}%)")
+          f"min {100 * rep['per_prompt_explained_min']:.1f}%{note})")
     print(f"  residual cosine: within-domain {rep['residual_within_domain_cos']:.4f}"
           f"  between-domain {rep['residual_between_domain_cos']:.4f}"
           f"  gap {rep['domain_structure_gap']:+.4f}")

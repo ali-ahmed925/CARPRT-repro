@@ -114,6 +114,43 @@ def fit_lowrank(
     return torch.eye(d, device=m.device, dtype=m.dtype).unsqueeze(0) + b_r
 
 
+def fit_affine(
+    m: torch.Tensor,
+    z: torch.Tensor,
+    lam: Optional[float] = None,
+) -> torch.Tensor:
+    """z_{i,c} ~= T_i m_c + a_i. Returns the augmented operator (P, D+1, D).
+
+    THE nested baseline. fit_ridge_identity (a = 0) and fit_additive (T = I) are
+    both special cases, so the incremental value of the *matrix given the shift*
+    becomes measurable instead of inferred from two non-nested models.
+
+    Shrinkage target is [I; 0]: identity for the linear part, zero for the bias.
+    Row D of the result is a_i.
+    """
+    p, c, d = z.shape
+    lam = auto_lambda(m) if lam is None else lam
+
+    ones = torch.ones(c, 1, device=m.device, dtype=m.dtype)
+    m_aug = torch.cat([m, ones], dim=1)                         # (C, D+1)
+
+    target = torch.cat(
+        [torch.eye(d, device=m.device, dtype=m.dtype),
+         torch.zeros(1, d, device=m.device, dtype=m.dtype)], dim=0)   # (D+1, D)
+
+    rhs = torch.einsum("ck,pce->pke", m_aug, z) + lam * target
+    return _solve(_gram(m_aug, lam), rhs)
+
+
+def predict_affine(m_target: torch.Tensor, w_aug: torch.Tensor) -> torch.Tensor:
+    """Synthesize with the affine model. w_aug is (P, D+1, D)."""
+    ones = torch.ones(m_target.shape[0], 1,
+                      device=m_target.device, dtype=m_target.dtype)
+    m_aug = torch.cat([m_target, ones], dim=1)
+    z = torch.einsum("ck,pke->pce", m_aug, w_aug)
+    return z / z.norm(dim=-1, keepdim=True)
+
+
 def fit_additive(m: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
     """The additive-style null: z_{i,c} ~= m_c + a_i. Returns a of shape (P, D).
 
@@ -185,4 +222,22 @@ ESTIMATORS = {
     "ridge": fit_ridge_identity,
     "procrustes": fit_procrustes,
     "lowrank": fit_lowrank,
+    "affine": fit_affine,
 }
+
+
+def n_params(kind: str, d: int, rank: Optional[int] = None) -> int:
+    """Free parameters per prompt, for the cost side of the ledger.
+
+    A rank-r matrix in R^{DxD} has r(2D - r) free parameters, not D^2 -- which is
+    the whole point of asking how much rank the operator actually needs.
+    """
+    if kind == "identity":
+        return 0
+    if kind == "additive":
+        return d
+    if kind == "affine":
+        return d * d + d
+    if kind == "lowrank":
+        return int(rank) * (2 * d - int(rank))
+    return d * d
