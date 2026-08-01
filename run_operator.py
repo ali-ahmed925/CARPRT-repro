@@ -259,20 +259,39 @@ def _dose_classes(args, tf, img_f, targets, classnames, alphas, seeds, results):
 
     print(f"\n  median count stays ~constant across rows by construction, so any")
     print(f"  trend in 'gain' is attributable to C rather than to evidence volume.")
-    if len(rows) >= 2:
-        lo_c = min(rows, key=lambda r: r["n_classes"])
-        hi_c = max(rows, key=lambda r: r["n_classes"])
-        print(f"\n  C={hi_c['n_classes']}: gain {hi_c['gain']:+.2f}   "
-              f"C={lo_c['n_classes']}: gain {lo_c['gain']:+.2f}")
-        if lo_c["gain"] > hi_c["gain"] + 1.0:
-            print(f"  >>> C IS THE DRIVER: the gain grows as classes are removed. C is "
-                  f"known at\n      inference with no labels, so the rule is predictive.")
-        elif abs(lo_c["gain"] - hi_c["gain"]) < 1.0:
-            print(f"  >>> C IS NOT THE DRIVER: the gain is flat in C. The EuroSAT effect "
-                  f"is\n      domain-specific, not a function of class count.")
+    # The alpha=0 member uses this module's empty-cell floor, while CARPRT uses
+    # w'=0; the two diverge as cells empty out, so "gain vs CARPRT" partly measures
+    # that convention. Isolate the count factor by differencing WITHIN the family.
+    usable = [r for r in rows if r["carprt"] < 98.0]
+    dropped = len(rows) - len(usable)
+    if dropped:
+        print(f"\n  {dropped} row(s) excluded from the verdict: CARPRT above 98%, so"
+              f"\n  there is no headroom for any method to differ (ceiling effect).")
+
+    print(f"\n{'C':>5}{'count-factor effect':>22}   (alpha={args.alpha:g} minus alpha=0,"
+          f" same empty-cell convention)")
+    print("-" * 62)
+    iso = []
+    for r in usable:
+        a0 = r["curve"].get(0.0)
+        af = r["curve"].get(args.alpha)
+        if a0 is None or af is None:
+            continue
+        iso.append((r["n_classes"], af - a0))
+        print(f"{r['n_classes']:>5}{af - a0:>22.2f}")
+
+    if len(iso) >= 2:
+        (c_hi, e_hi), (c_lo, e_lo) = max(iso), min(iso)
+        if e_lo - e_hi > 1.0:
+            print(f"\n  >>> C MODULATES THE EFFECT: the count factor goes from "
+                  f"{e_hi:+.2f} at C={c_hi}\n      to {e_lo:+.2f} at C={c_lo}. Note where "
+                  f"it crosses zero -- below that C the\n      factor helps, above it "
+                  f"it harms. C is known at inference without labels.")
+        elif abs(e_lo - e_hi) < 1.0:
+            print(f"\n  >>> C DOES NOT MODULATE THE EFFECT: {e_hi:+.2f} at C={c_hi} vs "
+                  f"{e_lo:+.2f} at C={c_lo}.")
         else:
-            print(f"  >>> gain DECREASES as classes are removed -- opposite to the "
-                  f"cross-dataset\n      ordering. Neither C nor count explains it.")
+            print(f"\n  >>> effect moves the WRONG way in C ({e_hi:+.2f} -> {e_lo:+.2f}).")
     results["dose_classes"] = rows
     return results
 
