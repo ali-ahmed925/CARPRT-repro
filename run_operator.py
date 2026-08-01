@@ -325,14 +325,13 @@ def run_bayes(args, clip_model, logit_scale, m_fit, z_fit, m_tgt, z_tgt,
         gate[name] = sp
         print(f"{name:<32}{sp:>20.4f}{a:>11.2f}")
     ref = gate["mean (CARPRT's rule)"]
-    winners = {k: v for k, v in gate.items() if v > ref + 0.01}
-    if winners:
-        print(f"\n  >>> {max(winners, key=winners.get)} ranks better than CARPRT "
-              f"({max(winners.values()):.4f} vs {ref:.4f}). Worth concentrating on.")
-    else:
-        print(f"\n  >>> NO rule ranks better than CARPRT's {ref:.4f}. Every "
-              f"configuration below\n      will lose, and for the known reason: "
-              f"concentration amplifies ranking errors.")
+    print(f"\n  CAUTION: this reference oracle is the FULL FIT ({orc_acc:.2f}), which is"
+          f"\n  overfit -- 9,139 free parameters on {img_f.shape[0]} images. Agreement with an"
+          f"\n  overfit target is not the same as being right, and the t-statistic"
+          f"\n  falsified the predictive reading of this table: it ranks BELOW"
+          f"\n  CARPRT ({gate.get('t-statistic (mu-mu_bar)/se', float('nan')):.4f} vs {ref:.4f})"
+          f" and still classifies better. Read the"
+          f"\n  Spearman column as description, not as a gate.")
     results["gate"] = gate
     del sim
     torch.cuda.empty_cache()
@@ -444,9 +443,17 @@ def run_bayes(args, clip_model, logit_scale, m_fit, z_fit, m_tgt, z_tgt,
             best = {"acc": rows[-1]["acc"], "lam": best_lam, "beta": beta}
 
     banner("verdict")
+    # The alpha sweep is where the surviving result lives; a verdict that looks
+    # only at the lambda/beta grid reports +0.00 and contradicts the tables above.
+    a_best = max(alpha_rows, key=lambda r: r["acc_b"])
+    if a_best["acc_b"] > best["acc"]:
+        best = {"acc": a_best["acc_b"], "lam": 0.0, "beta": 0.0,
+                "alpha": a_best["alpha"], "p": a_best["p_exact"]}
     print(f"  CARPRT              {base:.2f}")
-    print(f"  best configuration  {best['acc']:.2f}  "
-          f"(lambda={best['lam']:g}, beta={best['beta']:g})   {best['acc'] - base:+.2f}")
+    lbl = (f"alpha={best['alpha']:g}" if "alpha" in best
+           else f"lambda={best['lam']:g}, beta={best['beta']:g}")
+    print(f"  best configuration  {best['acc']:.2f}  ({lbl})   {best['acc'] - base:+.2f}"
+          + (f"   paired p={best['p']:.2e}" if "p" in best else ""))
     se = (base / 100 * (1 - base / 100) / img_f.shape[0]) ** 0.5 * 100
     print(f"  one standard error on {img_f.shape[0]} images: {se:.2f}")
     if best["acc"] - base > 2 * se:
