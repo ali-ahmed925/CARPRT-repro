@@ -263,6 +263,67 @@ def posterior_weights(
             "unestimated_frac": float(unest.float().mean())}
 
 
+def score_variants(
+    s1: torch.Tensor,
+    s2: torch.Tensor,
+    n: torch.Tensor,
+    empty: str = "floor",
+) -> Dict[str, torch.Tensor]:
+    """Decompose the t-statistic into its factors, on a common per-class scale.
+
+        t = (mu - mu_bar) * sqrt(n) / sd
+
+    so the deviation can be multiplied by the count factor, divided by the
+    dispersion factor, or both. Isolating them says WHICH one carries any gain.
+    "count alone" drops the deviation entirely and scores purely by how often
+    prompt i selects class c -- information Eq. 10 discards completely, since it
+    averages the values and never asks how many there were.
+
+    Every variant is centred and rescaled to the per-class spread of the plain
+    deviation, so a fixed tau means the same thing for all of them and no rule
+    wins merely by being sharper. The rescaled plain deviation is returned too,
+    as a control: if it already departs from CARPRT, the rescaling itself is the
+    confound rather than any variant.
+
+    empty="floor" puts n == 0 cells far below every estimated cell, matching
+    CARPRT's effective treatment (w' = 0 against values of ~30). Note that is
+    NOT missing data -- a count of zero means the prompt never once chose that
+    class, which is evidence against it.
+    """
+    mu, _, _ = cell_statistics(s1, s2, n)
+    est = n > 1
+    cnt = est.sum(dim=0, keepdim=True).clamp_min(1).float()
+    mu_bar = torch.where(est, mu, torch.zeros_like(mu)).sum(dim=0, keepdim=True) / cnt
+    dev = mu - mu_bar
+
+    safe = torch.where(n == 0, torch.ones_like(n), n)
+    var = (s2 / safe - mu * mu).clamp_min(1e-12)
+    sd = var.sqrt()
+    nf = n.float().clamp_min(1.0)
+
+    raw = {
+        "dev (control)": dev,
+        "dev * sqrt(n)": dev * nf.sqrt(),
+        "dev / sd": dev / sd,
+        "dev * sqrt(n) / sd": dev * nf.sqrt() / sd,
+        "count alone: log n": nf.log(),
+    }
+
+    ref_sd = torch.where(est, dev, torch.zeros_like(dev)).std(
+        dim=0, keepdim=True).clamp_min(1e-8)
+
+    out = {}
+    for k, v in raw.items():
+        v = torch.where(est, v, torch.zeros_like(v))
+        v = v - v.mean(dim=0, keepdim=True)
+        v = v / v.std(dim=0, keepdim=True).clamp_min(1e-8) * ref_sd
+        if empty == "floor":
+            floor = v.min(dim=0, keepdim=True).values - 10.0 * ref_sd
+            v = torch.where(n == 0, floor.expand_as(v), v)
+        out[k] = v
+    return out
+
+
 def weight_summary(w: torch.Tensor) -> Dict[str, float]:
     p = w.shape[0]
     ent = -(w * w.clamp_min(1e-12).log()).sum(dim=0)

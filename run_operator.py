@@ -245,6 +245,42 @@ def run_bayes(args, clip_model, logit_scale, m_fit, z_fit, m_tgt, z_tgt,
     hdr = (f"\n{'configuration':<38}{'acc':>9}{'vs base':>10}"
            f"{'eff.prompts':>13}{'cls-std':>9}{'top10':>11}")
 
+    # ------------------------------------------------- decomposition + McNemar
+    from promptop import stats as st
+
+    banner("DECOMPOSITION: which factor of the t-statistic carries the gain?")
+    print("  t = (mu - mu_bar) * sqrt(n) / sd. Each variant is rescaled to the")
+    print("  per-class spread of the plain deviation, so none wins by sharpness")
+    print("  alone. 'dev (control)' is the rescaled plain deviation: it should")
+    print("  land on CARPRT, otherwise the rescaling is itself the confound.\n")
+
+    var_scores = by.score_variants(s1, s2, n, empty="floor")
+    base_pred = infer_mod._scores(img_f, tf, base_w).argmax(1)
+
+    hdr_d = (f"{'scoring rule':<34}{'acc':>8}{'vs base':>8}"
+             f"{'b':>7}{'c':>7}{'disc':>7}{'p(exact)':>11}")
+    print(hdr_d); print("-" * len(hdr_d))
+    print(f"  {'CARPRT (reference)':<32}{base:>8.2f}{0.0:>+8.2f}")
+    dec_rows = []
+    for name, sc in var_scores.items():
+        w = torch.softmax(sc / args.temp, dim=0)
+        pred = infer_mod._scores(img_f, tf, w).argmax(1)
+        r = st.mcnemar(base_pred, pred, targets, "CARPRT", name)
+        st.print_mcnemar(r)
+        s = by.weight_summary(w)
+        dec_rows.append({**r, **s})
+
+    print("\n  b = CARPRT right / variant wrong,  c = CARPRT wrong / variant right")
+    print("  p is the exact paired binomial (McNemar). The single-proportion SE")
+    print("  used earlier was the wrong yardstick for a paired comparison.")
+
+    print(f"\n{'scoring rule':<34}{'eff.prompts':>13}{'cls-std':>9}{'top10':>10}")
+    print("-" * 66)
+    for r in dec_rows:
+        print(f"  {r['name_b']:<32}{r['effective_prompts']:>13.1f}"
+              f"{r['cls_std']:>9.3f}{r['top10_mass']:>10.4f}")
+    results["decomposition"] = dec_rows
+
     banner("ablation: each component alone")
     print(hdr); print("-" * (len(hdr) - 1))
     add("CARPRT (reference)", base_w)
