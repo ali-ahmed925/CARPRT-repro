@@ -431,7 +431,7 @@ def run_validate(args, clip_model, logit_scale, m_fit, z_fit, m_tgt, z_tgt,
 
     alpha = args.alpha
     print(f"\n  FROZEN CONFIGURATION: score = (mu - mu_bar) * n^{alpha:g}, "
-          f"tau={args.temp:g}, empty=floor")
+          f"tau={args.temp:g}, impl={args.impl}")
     print(f"  No hyperparameter is tuned per dataset.\n")
 
     rows = []
@@ -652,7 +652,7 @@ def run_bayes(args, clip_model, logit_scale, m_fit, z_fit, m_tgt, z_tgt,
     print(hdr_a); print("-" * len(hdr_a))
     alpha_rows = []
     for a in [float(x) for x in args.alpha_power.split(",") if x]:
-        sc = by.count_power_scores(s1, s2, n, a, "floor")
+        sc = by.count_power_scores(s1, s2, n, a, impl=args.impl)
         w = torch.softmax(sc / args.temp, dim=0)
         pred = infer_mod._scores(img_f, tf, w).argmax(1)
         r = st.mcnemar(base_pred, pred, targets, "CARPRT", f"alpha={a:g}")
