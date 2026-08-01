@@ -18,6 +18,9 @@
     learn     A) how much accuracy a given label quality can support, and
               B) learn W from CARPRT's own pseudo-labels -- label-free, so its
               accuracy is directly comparable to CARPRT's
+    bayes     posterior prompt reweighting: empty-cell correction, variance-aware
+              shrinkage of w', and an image-free text-geometric prior, with a full
+              ablation over each component
     sweep     model-complexity ladder: identity / additive / affine / low-rank at
               several ranks / full ridge / Procrustes, each scored against its
               parameter cost, to see how much operator the gain actually needs
@@ -52,7 +55,7 @@ from utils import build_test_data_loader, clip_classifier
 def get_args():
     p = argparse.ArgumentParser(description="Prompt-operator pipeline.")
     p.add_argument("command", choices=["fit", "classify", "all", "sweep", "residual", "oracle",
-                            "characterize", "learn"])
+                            "characterize", "learn", "bayes"])
     p.add_argument("--fit-datasets", type=str, default="imagenet",
                    help="Slash-separated corpus for fitting, e.g. 'imagenet/sun397'.")
     p.add_argument("--target", type=str, default="oxford_pets",
@@ -80,6 +83,15 @@ def get_args():
                    default=12,
                    help="Pseudo-domains carved from class names for the residual "
                         "structure test.")
+    p.add_argument("--lam-sweep", dest="lam_sweep", type=str,
+                   default="0,0.25,0.5,1,2,4,8,16",
+                   help="Shrinkage strengths. 0 = no shrinkage.")
+    p.add_argument("--beta-sweep", dest="beta_sweep", type=str,
+                   default="0.1,0.25,0.5,1.0,2.0",
+                   help="Text-prior strengths, in SDs of the evidence term.")
+    p.add_argument("--prior-mode", dest="prior_mode", type=str,
+                   default="nearest", choices=["nearest", "mean"],
+                   help="Separability against the nearest confuser, or all.")
     p.add_argument("--label-quality", dest="label_quality", type=str,
                    default="1.0,0.95,0.90,0.8945,0.85,0.80",
                    help="Label accuracies for the sweep in the learn command.")
@@ -135,6 +147,102 @@ def set_seed(seed):
 
 def banner(title):
     print(f"\n{'=' * 74}\n{title}\n{'=' * 74}")
+
+
+def run_bayes(args, clip_model, logit_scale, m_fit, z_fit, m_tgt, z_tgt,
+              preprocess, results):
+    """Posterior prompt reweighting: empty-cell fix + shrinkage + text prior."""
+    from promptop import bayes as by
+    from promptop import oracle as oracle_mod
+
+    banner(f"downstream zero-shot: {args.target}")
+    loader, classnames, _ = build_test_data_loader(
+        args.target, args.data_root, preprocess)
+    print("  encoding images once ...")
+    img_f, targets = infer_mod.encode_images(loader, clip_model)
+    tf = clip_classifier(classnames, TEMPLATES, clip_model)
+    p, c = len(TEMPLATES), len(classnames)
+
+    def acc(w):
+        return 100.0 * (infer_mod._scores(img_f, tf, w).argmax(1)
+                        == targets).float().mean().item()
+
+    base_w = infer_mod.carprt_weights(img_f, tf, args.temp, args.chunk)
+    base = acc(base_w)
+    print(f"  CARPRT baseline: {base:.2f}")
+
+    s1, s2, n = by.weight_moments(img_f, tf, args.chunk)
+    empty_frac = float((n == 0).float().mean())
+    print(f"  cells with no image assigned: {100 * empty_frac:.1f}%  "
+          f"(median count {int(n.median())}, min {int(n.min())})")
+
+    delta = by.text_separability(tf, args.prior_mode)
+    print(f"  text separability delta: mean {float(delta.mean()):.4f}  "
+          f"min {float(delta.min()):.4f}  max {float(delta.max()):.4f}  "
+          f"(image-free, label-free)")
+
+    # anchor: lam=0, empty=zero, beta=0 must reproduce CARPRT
+    anc = by.posterior_weights(s1, s2, n, None, 0.0, 0.0, args.temp, "zero")
+    print(f"  anchor (lam=0, empty=zero, beta=0): {acc(anc['weights']):.2f} "
+          f"vs CARPRT {base:.2f}")
+
+    rows = []
+
+    def add(name, w, extra=""):
+        a = acc(w)
+        s = by.weight_summary(w)
+        rows.append({"name": name, "acc": a, "delta": a - base, **s})
+        print(f"{name:<38}{a:>9.2f}{a - base:>+10.2f}"
+              f"{s['effective_prompts']:>13.1f}{s['cls_std']:>9.3f}"
+              f"{s['top10_mass']:>11.4f}  {extra}")
+
+    hdr = (f"\n{'configuration':<38}{'acc':>9}{'vs base':>10}"
+           f"{'eff.prompts':>13}{'cls-std':>9}{'top10':>11}")
+
+    banner("ablation: each component alone")
+    print(hdr); print("-" * (len(hdr) - 1))
+    add("CARPRT (reference)", base_w)
+    add("1. empty-cell fix only",
+        by.posterior_weights(s1, s2, n, None, 0.0, 0.0, args.temp, "mean")["weights"])
+
+    banner("2. variance-aware shrinkage (lambda sweep, empty-cell fix on)")
+    print(hdr); print("-" * (len(hdr) - 1))
+    best_lam, best_lam_acc = 0.0, base
+    for lam in [float(x) for x in args.lam_sweep.split(",") if x]:
+        out = by.posterior_weights(s1, s2, n, None, lam, 0.0, args.temp, "mean")
+        add(f"   lambda={lam:g}", out["weights"],
+            f"mean shrinkage B={float(out['shrinkage'].mean()):.3f}")
+        if rows[-1]["acc"] > best_lam_acc:
+            best_lam, best_lam_acc = lam, rows[-1]["acc"]
+    print(f"\n  best lambda = {best_lam:g} at {best_lam_acc:.2f}")
+
+    banner("3. text-geometric prior (beta sweep, at the best lambda)")
+    print(hdr); print("-" * (len(hdr) - 1))
+    best = {"acc": best_lam_acc, "lam": best_lam, "beta": 0.0}
+    for beta in [float(x) for x in args.beta_sweep.split(",") if x]:
+        w = by.posterior_weights(s1, s2, n, delta, best_lam, beta,
+                                 args.temp, "mean")["weights"]
+        add(f"   lambda={best_lam:g}, beta={beta:g}", w)
+        if rows[-1]["acc"] > best["acc"]:
+            best = {"acc": rows[-1]["acc"], "lam": best_lam, "beta": beta}
+
+    banner("verdict")
+    print(f"  CARPRT              {base:.2f}")
+    print(f"  best configuration  {best['acc']:.2f}  "
+          f"(lambda={best['lam']:g}, beta={best['beta']:g})   {best['acc'] - base:+.2f}")
+    se = (base / 100 * (1 - base / 100) / img_f.shape[0]) ** 0.5 * 100
+    print(f"  one standard error on {img_f.shape[0]} images: {se:.2f}")
+    if best["acc"] - base > 2 * se:
+        v = f"SIGNIFICANT: {best['acc'] - base:+.2f} exceeds 2 SE ({2 * se:.2f})."
+    elif best["acc"] - base > se:
+        v = f"PROMISING: {best['acc'] - base:+.2f} exceeds 1 SE; needs more datasets."
+    else:
+        v = f"WITHIN NOISE: {best['acc'] - base:+.2f} is under 1 SE ({se:.2f})."
+    print(f"  >>> {v}")
+
+    results["bayes"] = {"baseline": base, "rows": rows, "best": best,
+                        "empty_frac": empty_frac, "se": se, "verdict": v}
+    return results
 
 
 def run_learn(args, clip_model, logit_scale, m_fit, z_fit, m_tgt, z_tgt,
@@ -687,11 +795,12 @@ def main():
     print(f"  M_tgt {tuple(m_tgt.shape)}  Z_tgt {tuple(z_tgt.shape)}")
 
     if args.command in ("sweep", "residual", "oracle", "characterize",
-                        "learn"):
+                        "learn", "bayes"):
         runner = {"sweep": run_sweep, "residual": run_residual,
                   "oracle": run_oracle,
                   "characterize": run_characterize,
-                  "learn": run_learn}[args.command]
+                  "learn": run_learn,
+                  "bayes": run_bayes}[args.command]
         runner(args, clip_model, logit_scale, m_fit, z_fit, m_tgt, z_tgt,
                preprocess, results)
         print(f"\ndone in {time.time() - t0:.1f}s")
