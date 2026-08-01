@@ -89,6 +89,13 @@ def get_args():
                    default=12,
                    help="Pseudo-domains carved from class names for the residual "
                         "structure test.")
+    p.add_argument("--dose-mode", dest="dose_mode", type=str,
+                   default="images", choices=["images", "classes"],
+                   help="images: vary how many images estimate the weights. "
+                        "classes: vary C at ~constant evidence per cell.")
+    p.add_argument("--dose-classes", dest="dose_classes", type=str,
+                   default="100,80,60,47,30,20,10",
+                   help="Class counts for --dose-mode classes.")
     p.add_argument("--dose-fracs", dest="dose_fracs", type=str,
                    default="1.0,0.5,0.25,0.125,0.0625,0.03125",
                    help="Fractions of the test set used to ESTIMATE weights.")
@@ -168,6 +175,108 @@ def banner(title):
     print(f"\n{'=' * 74}\n{title}\n{'=' * 74}")
 
 
+def _dose_classes(args, tf, img_f, targets, classnames, alphas, seeds, results):
+    """Vary the number of CLASSES at roughly constant evidence per cell.
+
+    The mirror of the image dose-response, and it isolates C almost for free:
+    subsetting to C' classes keeps only the images of those classes, so
+    n_images ~ N*C'/C and the median count per cell ~ n_images/C' ~ N/C stays
+    put. C moves, count density does not.
+
+    Absolute accuracy rises as C' shrinks because the task gets easier, but
+    CARPRT and the count rule are compared at the same C' on the same images, so
+    the delta is what matters.
+    """
+    from promptop import bayes as by
+    from promptop import stats as st
+
+    c_full = len(classnames)
+    grid = sorted({int(x) for x in args.dose_classes.split(",") if x
+                   and 2 <= int(x) <= c_full}, reverse=True)
+
+    banner(f"CLASS DOSE-RESPONSE on {args.target}  "
+           f"(C varies, evidence per cell ~constant)")
+    print(f"  full dataset has C={c_full}, {img_f.shape[0]} images\n")
+    hdr = (f"{'C}':>5}{'n_img':>8}{'med.count':>11}{'CARPRT':>9}"
+           f"{'best a':>8}{'peak':>9}{'gain':>8}"
+           f"{'a=' + format(args.alpha, 'g'):>9}{'gain':>8}")
+    print(hdr.replace("C}", "C'")); print("-" * len(hdr))
+
+    rows = []
+    for c_sub in grid:
+        per_seed = []
+        for sd in seeds:
+            g = torch.Generator().manual_seed(args.seed + sd)
+            cls = torch.randperm(c_full, generator=g)[:c_sub].sort().values.to(tf.device)
+
+            keep = (targets.unsqueeze(1) == cls.unsqueeze(0)).any(dim=1)
+            sub_img = img_f[keep]
+            remap = torch.full((c_full,), -1, dtype=torch.long, device=tf.device)
+            remap[cls] = torch.arange(c_sub, device=tf.device)
+            sub_tg = remap[targets[keep]]
+            sub_tf = tf[:, cls, :].contiguous()
+
+            def acc(w):
+                return 100.0 * (infer_mod._scores(sub_img, sub_tf, w).argmax(1)
+                                == sub_tg).float().mean().item()
+
+            w_base = infer_mod.carprt_weights(sub_img, sub_tf, args.temp, args.chunk)
+            s1, s2, nn = by.weight_moments(sub_img, sub_tf, args.chunk)
+            curve = {}
+            for a in alphas:
+                w = torch.softmax(
+                    by.count_power_scores(s1, s2, nn, a, "floor") / args.temp, dim=0)
+                curve[a] = (acc(w), infer_mod._scores(sub_img, sub_tf, w).argmax(1))
+            per_seed.append({
+                "base": acc(w_base), "med": float(nn.float().median()),
+                "n": int(sub_img.shape[0]), "curve": curve, "tg": sub_tg,
+                "pred_base": infer_mod._scores(sub_img, sub_tf, w_base).argmax(1)})
+
+        m = len(per_seed)
+        med = sum(s["med"] for s in per_seed) / m
+        nimg = sum(s["n"] for s in per_seed) / m
+        base = sum(s["base"] for s in per_seed) / m
+        mean_curve = {a: sum(s["curve"][a][0] for s in per_seed) / m for a in alphas}
+        best_a = max(mean_curve, key=mean_curve.get)
+        fixed = mean_curve.get(args.alpha, float("nan"))
+
+        last = per_seed[-1]
+        r = st.mcnemar(last["pred_base"], last["curve"][best_a][1], last["tg"],
+                       "CARPRT", f"a={best_a:g}")
+
+        print(f"{c_sub:>5}{nimg:>8.0f}{med:>11.1f}{base:>9.2f}"
+              f"{best_a:>8.3f}{mean_curve[best_a]:>9.2f}"
+              f"{mean_curve[best_a] - base:>+8.2f}"
+              f"{fixed:>9.2f}{fixed - base:>+8.2f}  {st.stars(r['p_exact'])}")
+        rows.append({"n_classes": c_sub, "n_img": nimg, "median_count": med,
+                     "carprt": base, "best_alpha": best_a,
+                     "peak": mean_curve[best_a],
+                     "gain": mean_curve[best_a] - base,
+                     "fixed_gain": fixed - base, "p": r["p_exact"],
+                     "curve": mean_curve})
+        del per_seed
+        torch.cuda.empty_cache()
+
+    print(f"\n  median count stays ~constant across rows by construction, so any")
+    print(f"  trend in 'gain' is attributable to C rather than to evidence volume.")
+    if len(rows) >= 2:
+        lo_c = min(rows, key=lambda r: r["n_classes"])
+        hi_c = max(rows, key=lambda r: r["n_classes"])
+        print(f"\n  C={hi_c['n_classes']}: gain {hi_c['gain']:+.2f}   "
+              f"C={lo_c['n_classes']}: gain {lo_c['gain']:+.2f}")
+        if lo_c["gain"] > hi_c["gain"] + 1.0:
+            print(f"  >>> C IS THE DRIVER: the gain grows as classes are removed. C is "
+                  f"known at\n      inference with no labels, so the rule is predictive.")
+        elif abs(lo_c["gain"] - hi_c["gain"]) < 1.0:
+            print(f"  >>> C IS NOT THE DRIVER: the gain is flat in C. The EuroSAT effect "
+                  f"is\n      domain-specific, not a function of class count.")
+        else:
+            print(f"  >>> gain DECREASES as classes are removed -- opposite to the "
+                  f"cross-dataset\n      ordering. Neither C nor count explains it.")
+    results["dose_classes"] = rows
+    return results
+
+
 def run_dose(args, clip_model, logit_scale, m_fit, z_fit, m_tgt, z_tgt,
              preprocess, results):
     """Dose-response: does the count gain scale with images per cell, causally?
@@ -197,8 +306,13 @@ def run_dose(args, clip_model, logit_scale, m_fit, z_fit, m_tgt, z_tgt,
                         == targets).float().mean().item()
 
     alphas = [float(x) for x in args.alpha_power.split(",") if x]
-    fracs = [float(x) for x in args.dose_fracs.split(",") if x]
     seeds = list(range(args.dose_seeds))
+
+    if args.dose_mode == "classes":
+        return _dose_classes(args, tf, img_f, targets, classnames, alphas,
+                             seeds, results)
+
+    fracs = [float(x) for x in args.dose_fracs.split(",") if x]
 
     banner(f"DOSE-RESPONSE on {args.target}  "
            f"(C={c} fixed, evaluation on all {n_all} images)")
