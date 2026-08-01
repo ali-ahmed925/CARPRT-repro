@@ -39,8 +39,16 @@ def mcnemar(
         chi2 = (abs(b - c) - 1) ** 2 / nd
         # P(chi2_1 > x) = erfc(sqrt(x/2))
         p_chi2 = math.erfc(math.sqrt(chi2 / 2.0)) if chi2 > 0 else 1.0
+        # Log space: math.comb(nd, i) / 2**nd overflows a float past nd ~ 1023,
+        # and any dataset with a few thousand images clears that easily. The
+        # log-sum-exp form is exact and has no such limit.
         k = max(b, c)
-        tail = sum(math.comb(nd, i) for i in range(k, nd + 1)) / (2.0 ** nd)
+        ln2 = math.log(2.0)
+        logs = [math.lgamma(nd + 1) - math.lgamma(i + 1)
+                - math.lgamma(nd - i + 1) - nd * ln2
+                for i in range(k, nd + 1)]
+        mx = max(logs)
+        tail = math.exp(mx + math.log(sum(math.exp(v - mx) for v in logs)))
         p_exact = min(1.0, 2.0 * tail)
 
     # Keys are identical in every branch: callers index this dict directly, and a
