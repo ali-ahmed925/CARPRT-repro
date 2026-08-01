@@ -15,6 +15,9 @@
               stats, whether the missing accuracy is class-agnostic or
               class-specific, and which accumulated statistic best predicts the
               oracle (which forecasts whether a new estimator will work)
+    learn     A) how much accuracy a given label quality can support, and
+              B) learn W from CARPRT's own pseudo-labels -- label-free, so its
+              accuracy is directly comparable to CARPRT's
     sweep     model-complexity ladder: identity / additive / affine / low-rank at
               several ranks / full ridge / Procrustes, each scored against its
               parameter cost, to see how much operator the gain actually needs
@@ -49,7 +52,7 @@ from utils import build_test_data_loader, clip_classifier
 def get_args():
     p = argparse.ArgumentParser(description="Prompt-operator pipeline.")
     p.add_argument("command", choices=["fit", "classify", "all", "sweep", "residual", "oracle",
-                            "characterize"])
+                            "characterize", "learn"])
     p.add_argument("--fit-datasets", type=str, default="imagenet",
                    help="Slash-separated corpus for fitting, e.g. 'imagenet/sun397'.")
     p.add_argument("--target", type=str, default="oxford_pets",
@@ -77,6 +80,17 @@ def get_args():
                    default=12,
                    help="Pseudo-domains carved from class names for the residual "
                         "structure test.")
+    p.add_argument("--label-quality", dest="label_quality", type=str,
+                   default="1.0,0.95,0.90,0.8945,0.85,0.80",
+                   help="Label accuracies for the sweep in the learn command.")
+    p.add_argument("--kl-sweep", dest="kl_sweep", type=str,
+                   default="0,0.01,0.1,1,10",
+                   help="KL-to-CARPRT penalties. Large values recover CARPRT.")
+    p.add_argument("--learn-steps", dest="learn_steps", type=int, default=300)
+    p.add_argument("--pseudo-source", dest="pseudo_source", type=str,
+                   default="carprt", choices=["carprt", "mpe"],
+                   help="carprt: higher quality but self-referential. mpe: "
+                        "independent of W, lower quality.")
     p.add_argument("--oracle-steps", dest="oracle_steps", type=int, default=400,
                    help="Adam steps for the best-W ceiling.")
     p.add_argument("--oracle-lr", dest="oracle_lr", type=float, default=0.05)
@@ -121,6 +135,99 @@ def set_seed(seed):
 
 def banner(title):
     print(f"\n{'=' * 74}\n{title}\n{'=' * 74}")
+
+
+def run_learn(args, clip_model, logit_scale, m_fit, z_fit, m_tgt, z_tgt,
+              preprocess, results):
+    """Label-quality sweep (prediction) + learned weights from pseudo-labels (method)."""
+    from promptop import oracle as oracle_mod
+    from promptop import learned as lrn
+
+    banner(f"downstream zero-shot: {args.target}")
+    loader, classnames, _ = build_test_data_loader(
+        args.target, args.data_root, preprocess)
+    print("  encoding images once ...")
+    img_f, targets = infer_mod.encode_images(loader, clip_model)
+    tf_true = clip_classifier(classnames, TEMPLATES, clip_model)
+    n, p, c = img_f.shape[0], len(TEMPLATES), len(classnames)
+    if oracle_mod.estimate_bytes(n, p, c) > 4.0:
+        raise SystemExit("similarity tensor too large for this target.")
+    sim = oracle_mod.similarity_tensor(img_f, tf_true, args.chunk)
+
+    w_carprt = infer_mod.carprt_weights(img_f, tf_true, args.temp, args.chunk)
+    _, theta0 = infer_mod.carprt_weights_split_value(
+        img_f, tf_true, tf_true, args.temp, args.chunk)
+    base = oracle_mod._accuracy(sim, w_carprt, targets)
+    print(f"  CARPRT baseline: {base:.2f}")
+
+    # ---------------------------------------------------------------- part A
+    banner("A. label-quality sweep: what accuracy can a given label quality support?")
+    print("  (uses TRUE labels degraded to a target accuracy, then scores against")
+    print("   TRUE labels. Random corruption is optimistic -- real pseudo-label")
+    print("   errors concentrate on confusable classes -- so read it as a ceiling.)\n")
+    hdr = f"{'label accuracy':>16}{'achieved':>11}{'vs CARPRT':>12}"
+    print(hdr); print("-" * len(hdr))
+    qual_rows = []
+    for q in [float(x) for x in args.label_quality.split(",") if x]:
+        lab = targets if q >= 1.0 else lrn.corrupt_labels(targets, q, c, args.seed)
+        got = 100.0 * (lab == targets).float().mean().item()
+        out = lrn.learn_weights(sim, lab, theta0, args.temp, args.oracle_steps,
+                                args.oracle_lr, 0.0)
+        acc = oracle_mod._accuracy(sim, out["weights"], targets)
+        qual_rows.append({"label_acc": got, "acc": acc})
+        print(f"{got:>15.1f}%{acc:>11.2f}{acc - base:>+12.2f}")
+    results["label_quality_sweep"] = qual_rows
+
+    # ---------------------------------------------------------------- part B
+    banner("B. learned weights from CARPRT's own pseudo-labels (no labels used)")
+    src = (w_carprt if args.pseudo_source == "carprt"
+           else torch.full((p, c), 1.0 / p, device=sim.device))
+    pl = lrn.pseudo_labels(sim, src)
+    pl_acc = 100.0 * (pl == targets).float().mean().item()
+    print(f"  pseudo-label source: {args.pseudo_source}  "
+          f"(accuracy {pl_acc:.2f}%, {int((pl != targets).sum())} wrong of {n})\n")
+
+    hdr = (f"{'KL weight':>11}{'accuracy':>11}{'vs CARPRT':>12}"
+           f"{'eff.prompts':>13}{'cls-std':>10}{'top10 mass':>12}")
+    print(hdr); print("-" * len(hdr))
+    learn_rows = []
+    traj_store = []
+    for klw in [float(x) for x in args.kl_sweep.split(",") if x]:
+        out = lrn.learn_weights(sim, pl, theta0, args.temp, args.learn_steps,
+                                args.oracle_lr, klw, eval_targets=targets,
+                                log_every=max(args.learn_steps // 6, 1))
+        acc = oracle_mod._accuracy(sim, out["weights"], targets)
+        s = out["stats"]
+        print(f"{klw:>11.3g}{acc:>11.2f}{acc - base:>+12.2f}"
+              f"{s['effective_prompts']:>13.1f}"
+              f"{s['across_class_std_over_uniform']:>10.3f}"
+              f"{s['top10_mass']:>12.4f}")
+        learn_rows.append({"kl": klw, "acc": acc, **s})
+        traj_store.append((klw, out["trajectory"]))
+
+    print("\n  accuracy trajectory during optimisation (diagnostic only -- nothing")
+    print("  is selected on it; reported weights are always the final iterate):")
+    for klw, tr in traj_store:
+        lrn.print_trajectory(tr, f"KL={klw:g}")
+
+    best = max(learn_rows, key=lambda r: r["acc"])
+    delta = best["acc"] - base
+    print(f"\n  CARPRT {base:.2f} | best learned {best['acc']:.2f} "
+          f"(KL={best['kl']:g}) | {delta:+.2f}")
+    if delta <= 0:
+        verdict = ("NO GAIN: learning W from pseudo-labels does not beat Eq. 10. "
+                   "Self-confirmation or pseudo-label noise dominates.")
+    elif delta < 0.6:
+        verdict = (f"MARGINAL: {delta:+.2f} is ~{delta * n / 100:.0f} images of {n}, "
+                   f"inside one standard error.")
+    else:
+        verdict = (f"GAIN: {delta:+.2f} points over CARPRT using no labels at all.")
+    print(f"  >>> {verdict}")
+
+    results["learned"] = learn_rows
+    results["learned_verdict"] = verdict
+    results["pseudo_label_accuracy"] = pl_acc
+    return results
 
 
 def run_characterize(args, clip_model, logit_scale, m_fit, z_fit, m_tgt, z_tgt,
@@ -579,10 +686,12 @@ def main():
     print(f"  M_fit {tuple(m_fit.shape)}  Z_fit {tuple(z_fit.shape)}")
     print(f"  M_tgt {tuple(m_tgt.shape)}  Z_tgt {tuple(z_tgt.shape)}")
 
-    if args.command in ("sweep", "residual", "oracle", "characterize"):
+    if args.command in ("sweep", "residual", "oracle", "characterize",
+                        "learn"):
         runner = {"sweep": run_sweep, "residual": run_residual,
                   "oracle": run_oracle,
-                  "characterize": run_characterize}[args.command]
+                  "characterize": run_characterize,
+                  "learn": run_learn}[args.command]
         runner(args, clip_model, logit_scale, m_fit, z_fit, m_tgt, z_tgt,
                preprocess, results)
         print(f"\ndone in {time.time() - t0:.1f}s")
