@@ -3,6 +3,35 @@
 Research directions that move past scalar reweighting of prompt–class similarities.
 Written 2026-08-01. Self-contained: assumes no memory of the conversation that produced it.
 
+> ## STATUS — read [FINDINGS.md](FINDINGS.md) first
+>
+> **Idea 2 (prompt operators) has been implemented and closed.** The hypothesis is
+> confirmed — prompts really do act as operators (0.916 held-out centred cosine, `{}`
+> recovering $T=I$, a ~16-dimensional operator manifold) — and it does not help:
+> synthesized embeddings cost −5.61 accuracy, and a 512-parameter additive shift captures
+> 82% of the operator's benefit against 262,144 parameters.
+>
+> Measuring *why* produced something more useful than the idea itself. On Oxford Pets:
+>
+> - **+3.57** points of generalisable headroom exist above CARPRT, and **70%** of it is
+>   class-specific rather than per-prompt.
+> - **Pseudo-labels are not the bottleneck** (+0.14 with ground truth). Eq. 10's functional
+>   form is.
+> - Optimal weights are **sparse** (6.2 effective prompts of 247) where CARPRT's are diffuse
+>   (95.6) — but reproducing that sparsity gains nothing, because the missing information is
+>   *which* prompts, not how many.
+> - Five independent attacks all land inside one standard error. **The information needed is
+>   not in the $(N,P,C)$ similarity tensor.**
+>
+> **Consequence for this document.** Ideas 1 and 3 below operate on that same tensor and are
+> therefore likely subject to the same ceiling. **Idea 4 (Gromov–Wasserstein) is the one that
+> escapes it**, since it introduces image-manifold structure — a signal none of the tested
+> methods use. It is now the recommended direction, and the findings supply the evidence it
+> previously lacked.
+>
+> Before acting on any of this, re-run `oracle` and `characterize` on DTD and Caltech101:
+> every number above is from a single dataset with CARPRT's largest margin in the paper.
+
 ---
 
 ## 0. Where things stand
