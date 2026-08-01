@@ -21,6 +21,8 @@
     bayes     posterior prompt reweighting: empty-cell correction, variance-aware
               shrinkage of w', and an image-free text-geometric prior, with a full
               ablation over each component
+    validate  apply ONE frozen estimator across several datasets with no
+              sweeping available, reporting a paired McNemar test per dataset
     sweep     model-complexity ladder: identity / additive / affine / low-rank at
               several ranks / full ridge / Procrustes, each scored against its
               parameter cost, to see how much operator the gain actually needs
@@ -55,7 +57,8 @@ from utils import build_test_data_loader, clip_classifier
 def get_args():
     p = argparse.ArgumentParser(description="Prompt-operator pipeline.")
     p.add_argument("command", choices=["fit", "classify", "all", "sweep", "residual", "oracle",
-                            "characterize", "learn", "bayes"])
+                            "characterize", "learn", "bayes",
+                            "validate"])
     p.add_argument("--fit-datasets", type=str, default="imagenet",
                    help="Slash-separated corpus for fitting, e.g. 'imagenet/sun397'.")
     p.add_argument("--target", type=str, default="oxford_pets",
@@ -83,6 +86,14 @@ def get_args():
                    default=12,
                    help="Pseudo-domains carved from class names for the residual "
                         "structure test.")
+    p.add_argument("--alpha-power", dest="alpha_power", type=str,
+                   default="0,0.125,0.25,0.375,0.5,0.625,0.75,1.0",
+                   help="Exponents for the n^alpha sweep. 0 = CARPRT.")
+    p.add_argument("--alpha", type=float, default=0.5,
+                   help="FROZEN exponent for the validate command.")
+    p.add_argument("--targets", type=str,
+                   default="oxford_pets/dtd/caltech101/eurosat/oxford_flowers",
+                   help="Slash-separated datasets for the validate command.")
     p.add_argument("--lam-sweep", dest="lam_sweep", type=str,
                    default="0,0.25,0.5,1,2,4,8,16",
                    help="Shrinkage strengths. 0 = no shrinkage.")
@@ -147,6 +158,96 @@ def set_seed(seed):
 
 def banner(title):
     print(f"\n{'=' * 74}\n{title}\n{'=' * 74}")
+
+
+def run_validate(args, clip_model, logit_scale, m_fit, z_fit, m_tgt, z_tgt,
+                 preprocess, results):
+    """Apply ONE frozen estimator to several datasets. No sweeping, by design.
+
+    The alpha that wins on a single dataset is a selection, not a result. This
+    command exposes no hyperparameter search: it takes the frozen alpha, runs it
+    untouched on every target, and reports a paired test per dataset. That is
+    what separates a finding from a tuning exercise.
+    """
+    from promptop import bayes as by
+    from promptop import stats as st
+
+    alpha = args.alpha
+    print(f"\n  FROZEN CONFIGURATION: score = (mu - mu_bar) * n^{alpha:g}, "
+          f"tau={args.temp:g}, empty=floor")
+    print(f"  No hyperparameter is tuned per dataset.\n")
+
+    rows = []
+    for name in [d for d in args.targets.split("/") if d]:
+        banner(f"{name}")
+        try:
+            loader, classnames, _ = build_test_data_loader(
+                name, args.data_root, preprocess)
+        except Exception as exc:                                   # noqa: BLE001
+            print(f"  [skip] {type(exc).__name__}: {exc}")
+            continue
+
+        img_f, targets = infer_mod.encode_images(loader, clip_model)
+        tf = clip_classifier(classnames, TEMPLATES, clip_model)
+        p, c = len(TEMPLATES), len(classnames)
+
+        w_base = infer_mod.carprt_weights(img_f, tf, args.temp, args.chunk)
+        pred_base = infer_mod._scores(img_f, tf, w_base).argmax(1)
+        base = 100.0 * (pred_base == targets).float().mean().item()
+
+        uni = torch.full((p, c), 1.0 / p, device=tf.device)
+        mpe = 100.0 * (infer_mod._scores(img_f, tf, uni).argmax(1)
+                       == targets).float().mean().item()
+
+        s1, s2, n = by.weight_moments(img_f, tf, args.chunk)
+        w_new = torch.softmax(
+            by.count_power_scores(s1, s2, n, alpha, "floor") / args.temp, dim=0)
+        pred_new = infer_mod._scores(img_f, tf, w_new).argmax(1)
+        r = st.mcnemar(pred_base, pred_new, targets, "CARPRT", "ours")
+
+        row = {"dataset": name, "classes": c, "images": int(img_f.shape[0]),
+               "mpe": mpe, "carprt": base, "ours": r["acc_b"],
+               "delta": r["acc_b"] - base, "b": r["b"], "c": r["c"],
+               "discordant": r["discordant"], "p": r["p_exact"],
+               "empty_frac": float((n == 0).float().mean())}
+        rows.append(row)
+        print(f"  {c} classes, {row['images']} images, "
+              f"{100 * row['empty_frac']:.1f}% empty cells")
+        print(f"  MPE {mpe:.2f} | CARPRT {base:.2f} | ours {r['acc_b']:.2f} "
+              f"({row['delta']:+.2f}, b={r['b']} c={r['c']}, "
+              f"p={r['p_exact']:.2e} {st.stars(r['p_exact'])})")
+        del img_f, targets, tf, s1, s2, n
+        torch.cuda.empty_cache()
+
+    banner(f"VALIDATION SUMMARY  (alpha={alpha:g}, frozen)")
+    hdr = (f"{'dataset':<16}{'C':>5}{'N':>7}{'MPE':>8}{'CARPRT':>9}"
+           f"{'ours':>8}{'delta':>8}{'disc':>7}{'p':>10}")
+    print(hdr); print("-" * len(hdr))
+    for r in rows:
+        print(f"{r['dataset']:<16}{r['classes']:>5}{r['images']:>7}"
+              f"{r['mpe']:>8.2f}{r['carprt']:>9.2f}{r['ours']:>8.2f}"
+              f"{r['delta']:>+8.2f}{r['discordant']:>7}{r['p']:>10.1e}"
+              f"  {st.stars(r['p'])}")
+
+    if rows:
+        deltas = [r["delta"] for r in rows]
+        mean_d = sum(deltas) / len(deltas)
+        wins = sum(1 for d in deltas if d > 0)
+        print(f"\n  mean delta {mean_d:+.2f} over {len(rows)} datasets, "
+              f"positive on {wins}/{len(rows)}")
+        if len(rows) >= 3 and wins == len(rows):
+            v = ("CONSISTENT: positive on every dataset. This is a finding, not "
+                 "a selection artifact.")
+        elif mean_d > 0 and wins > len(rows) / 2:
+            v = ("MIXED: positive on average but not everywhere. Report per "
+                 "dataset and do not claim a universal gain.")
+        else:
+            v = ("NOT REPRODUCED: the Pets gain did not transfer. It was "
+                 "selection on one dataset.")
+        print(f"  >>> {v}")
+        results["validate"] = {"alpha": alpha, "rows": rows,
+                               "mean_delta": mean_d, "verdict": v}
+    return results
 
 
 def run_bayes(args, clip_model, logit_scale, m_fit, z_fit, m_tgt, z_tgt,
@@ -280,6 +381,33 @@ def run_bayes(args, clip_model, logit_scale, m_fit, z_fit, m_tgt, z_tgt,
         print(f"  {r['name_b']:<32}{r['effective_prompts']:>13.1f}"
               f"{r['cls_std']:>9.3f}{r['top10_mass']:>10.4f}")
     results["decomposition"] = dec_rows
+
+    banner("ALPHA SWEEP: score = (mu - mu_bar) * n^alpha,  alpha=0 is CARPRT")
+    print("  A one-parameter family containing the baseline. Read the SHAPE, not")
+    print("  the peak: a smooth rise and fall is evidence of a real effect, a")
+    print("  jagged curve means the earlier +0.76 landed on sqrt(n) by chance.\n")
+    hdr_a = (f"{'alpha':>8}{'acc':>9}{'vs base':>9}{'b':>7}{'c':>7}"
+             f"{'disc':>7}{'p(exact)':>11}{'eff.prompts':>13}")
+    print(hdr_a); print("-" * len(hdr_a))
+    alpha_rows = []
+    for a in [float(x) for x in args.alpha_power.split(",") if x]:
+        sc = by.count_power_scores(s1, s2, n, a, "floor")
+        w = torch.softmax(sc / args.temp, dim=0)
+        pred = infer_mod._scores(img_f, tf, w).argmax(1)
+        r = st.mcnemar(base_pred, pred, targets, "CARPRT", f"alpha={a:g}")
+        s = by.weight_summary(w)
+        print(f"{a:>8.2f}{r['acc_b']:>9.2f}{r['acc_b'] - base:>+9.2f}"
+              f"{r['b']:>7}{r['c']:>7}{r['discordant']:>7}"
+              f"{r['p_exact']:>11.2e}{s['effective_prompts']:>13.1f}"
+              f"  {st.stars(r['p_exact'])}")
+        alpha_rows.append({"alpha": a, **r, **s})
+    results["alpha_sweep"] = alpha_rows
+
+    peak = max(alpha_rows, key=lambda r: r["acc_b"])
+    print(f"\n  peak at alpha={peak['alpha']:g}: {peak['acc_b']:.2f} "
+          f"({peak['acc_b'] - base:+.2f}, p={peak['p_exact']:.2e})")
+    print(f"  NOTE: selected on this dataset. Freeze alpha and validate with")
+    print(f"        'python run_operator.py validate --alpha {peak['alpha']:g}'")
 
     banner("ablation: each component alone")
     print(hdr); print("-" * (len(hdr) - 1))
@@ -880,12 +1008,13 @@ def main():
     print(f"  M_tgt {tuple(m_tgt.shape)}  Z_tgt {tuple(z_tgt.shape)}")
 
     if args.command in ("sweep", "residual", "oracle", "characterize",
-                        "learn", "bayes"):
+                        "learn", "bayes", "validate"):
         runner = {"sweep": run_sweep, "residual": run_residual,
                   "oracle": run_oracle,
                   "characterize": run_characterize,
                   "learn": run_learn,
-                  "bayes": run_bayes}[args.command]
+                  "bayes": run_bayes,
+                  "validate": run_validate}[args.command]
         runner(args, clip_model, logit_scale, m_fit, z_fit, m_tgt, z_tgt,
                preprocess, results)
         print(f"\ndone in {time.time() - t0:.1f}s")

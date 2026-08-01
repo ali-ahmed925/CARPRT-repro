@@ -263,6 +263,63 @@ def posterior_weights(
             "unestimated_frac": float(unest.float().mean())}
 
 
+def _deviation(s1: torch.Tensor, s2: torch.Tensor, n: torch.Tensor):
+    """Shared pieces: per-cell mean, class mean, deviation, dispersion, mask."""
+    mu, _, _ = cell_statistics(s1, s2, n)
+    est = n > 1
+    cnt = est.sum(dim=0, keepdim=True).clamp_min(1).float()
+    mu_bar = torch.where(est, mu, torch.zeros_like(mu)).sum(dim=0, keepdim=True) / cnt
+    dev = mu - mu_bar
+    safe = torch.where(n == 0, torch.ones_like(n), n)
+    sd = (s2 / safe - mu * mu).clamp_min(1e-12).sqrt()
+    return mu, mu_bar, dev, sd, est
+
+
+def _rescale_and_floor(
+    v: torch.Tensor,
+    dev: torch.Tensor,
+    est: torch.Tensor,
+    n: torch.Tensor,
+    empty: str = "floor",
+) -> torch.Tensor:
+    """Put a score on the plain deviation's per-class scale, then floor empties.
+
+    Without this a rule can win purely by being sharper, which is the confound
+    that made the earlier t-statistic row read +1.12 instead of its true -0.08:
+    it rescaled against a std inflated by the zeros in the empty cells.
+    """
+    ref_sd = torch.where(est, dev, torch.zeros_like(dev)).std(
+        dim=0, keepdim=True).clamp_min(1e-8)
+    v = torch.where(est, v, torch.zeros_like(v))
+    v = v - v.mean(dim=0, keepdim=True)
+    v = v / v.std(dim=0, keepdim=True).clamp_min(1e-8) * ref_sd
+    if empty == "floor":
+        floor = v.min(dim=0, keepdim=True).values - 10.0 * ref_sd
+        v = torch.where(n == 0, floor.expand_as(v), v)
+    return v
+
+
+def count_power_scores(
+    s1: torch.Tensor,
+    s2: torch.Tensor,
+    n: torch.Tensor,
+    alpha: float = 0.5,
+    empty: str = "floor",
+) -> torch.Tensor:
+    """score = (mu - mu_bar) * n^alpha.
+
+    A one-parameter family containing CARPRT at alpha = 0. n_{i,c} counts how
+    often prompt i selects class c across the unlabeled set -- evidence of
+    affinity that Eq. 10 discards, since it averages the winning similarities and
+    never asks how many there were. alpha = 0.5 recovers the count factor of the
+    t-statistic, which the decomposition showed is the part that helps (the
+    dispersion factor 1/sd hurts and is deliberately absent here).
+    """
+    _, _, dev, _, est = _deviation(s1, s2, n)
+    v = dev * n.float().clamp_min(1.0).pow(alpha)
+    return _rescale_and_floor(v, dev, est, n, empty)
+
+
 def score_variants(
     s1: torch.Tensor,
     s2: torch.Tensor,
@@ -290,15 +347,7 @@ def score_variants(
     NOT missing data -- a count of zero means the prompt never once chose that
     class, which is evidence against it.
     """
-    mu, _, _ = cell_statistics(s1, s2, n)
-    est = n > 1
-    cnt = est.sum(dim=0, keepdim=True).clamp_min(1).float()
-    mu_bar = torch.where(est, mu, torch.zeros_like(mu)).sum(dim=0, keepdim=True) / cnt
-    dev = mu - mu_bar
-
-    safe = torch.where(n == 0, torch.ones_like(n), n)
-    var = (s2 / safe - mu * mu).clamp_min(1e-12)
-    sd = var.sqrt()
+    _, _, dev, sd, est = _deviation(s1, s2, n)
     nf = n.float().clamp_min(1.0)
 
     raw = {
@@ -308,20 +357,7 @@ def score_variants(
         "dev * sqrt(n) / sd": dev * nf.sqrt() / sd,
         "count alone: log n": nf.log(),
     }
-
-    ref_sd = torch.where(est, dev, torch.zeros_like(dev)).std(
-        dim=0, keepdim=True).clamp_min(1e-8)
-
-    out = {}
-    for k, v in raw.items():
-        v = torch.where(est, v, torch.zeros_like(v))
-        v = v - v.mean(dim=0, keepdim=True)
-        v = v / v.std(dim=0, keepdim=True).clamp_min(1e-8) * ref_sd
-        if empty == "floor":
-            floor = v.min(dim=0, keepdim=True).values - 10.0 * ref_sd
-            v = torch.where(n == 0, floor.expand_as(v), v)
-        out[k] = v
-    return out
+    return {k: _rescale_and_floor(v, dev, est, n, empty) for k, v in raw.items()}
 
 
 def weight_summary(w: torch.Tensor) -> Dict[str, float]:
