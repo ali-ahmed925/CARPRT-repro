@@ -186,6 +186,52 @@ def run_bayes(args, clip_model, logit_scale, m_fit, z_fit, m_tgt, z_tgt,
     print(f"  anchor (lam=0, empty=zero, beta=0): {acc(anc['weights']):.2f} "
           f"vs CARPRT {base:.2f}")
 
+    # ------------------------------------------------------------------ gate
+    banner("GATE: does any scoring rule rank prompts better than CARPRT's?")
+    print("  Per-class Spearman against the ORACLE weight matrix. Scale-invariant,")
+    print("  so it cannot be confounded by temperature. A rule that ranks no better")
+    print("  than CARPRT's 'mean' cannot help: concentrating on a worse ranking is")
+    print("  exactly what has failed every previous attempt.\n")
+    from promptop import characterize as ch
+    sim = oracle_mod.similarity_tensor(img_f, tf, args.chunk)
+    _, theta0 = infer_mod.carprt_weights_split_value(
+        img_f, tf, tf, args.temp, args.chunk)
+    w_oracle, orc_acc, _ = oracle_mod.oracle_optimal_w(
+        sim, targets, theta0, args.temp, args.oracle_steps, args.oracle_lr)
+    print(f"  oracle ceiling (full fit): {orc_acc:.2f}\n")
+
+    cands = {
+        "mean (CARPRT's rule)":
+            by.posterior_weights(s1, s2, n, None, 0.0, 0.0, args.temp, "zero"),
+        "mean + empty-cell fix":
+            by.posterior_weights(s1, s2, n, None, 0.0, 0.0, args.temp, "mean"),
+        "t-statistic (mu-mu_bar)/se":
+            by.posterior_weights(s1, s2, n, None, 0.0, 0.0, args.temp, "mean",
+                                 score_mode="tstat"),
+        "text prior alone":
+            by.posterior_weights(s1, s2, n, delta, 0.0, 1e6, args.temp, "mean"),
+    }
+    hdr_g = f"{'scoring rule':<32}{'spearman vs oracle':>20}{'accuracy':>11}"
+    print(hdr_g); print("-" * len(hdr_g))
+    gate = {}
+    for name, out in cands.items():
+        sp = ch.compare_pair(out["weights"], w_oracle)["spearman_per_class"]
+        a = acc(out["weights"])
+        gate[name] = sp
+        print(f"{name:<32}{sp:>20.4f}{a:>11.2f}")
+    ref = gate["mean (CARPRT's rule)"]
+    winners = {k: v for k, v in gate.items() if v > ref + 0.01}
+    if winners:
+        print(f"\n  >>> {max(winners, key=winners.get)} ranks better than CARPRT "
+              f"({max(winners.values()):.4f} vs {ref:.4f}). Worth concentrating on.")
+    else:
+        print(f"\n  >>> NO rule ranks better than CARPRT's {ref:.4f}. Every "
+              f"configuration below\n      will lose, and for the known reason: "
+              f"concentration amplifies ranking errors.")
+    results["gate"] = gate
+    del sim
+    torch.cuda.empty_cache()
+
     rows = []
 
     def add(name, w, extra=""):
@@ -204,6 +250,9 @@ def run_bayes(args, clip_model, logit_scale, m_fit, z_fit, m_tgt, z_tgt,
     add("CARPRT (reference)", base_w)
     add("1. empty-cell fix only",
         by.posterior_weights(s1, s2, n, None, 0.0, 0.0, args.temp, "mean")["weights"])
+    add("2. t-statistic (precision-weighted)",
+        by.posterior_weights(s1, s2, n, None, 0.0, 0.0, args.temp, "mean",
+                             score_mode="tstat")["weights"])
 
     banner("2. variance-aware shrinkage (lambda sweep, empty-cell fix on)")
     print(hdr); print("-" * (len(hdr) - 1))

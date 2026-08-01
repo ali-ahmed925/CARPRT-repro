@@ -134,13 +134,46 @@ def shrink(
 
     mu_t = mu_bar + b * (mu - mu_bar)
 
-    # A cell with n == 1 still has a usable *value* (CARPRT uses it) even though
-    # its variance is unestimable; only n == 0 is genuinely empty. Zeroing the
-    # n == 1 cells here would break the CARPRT anchor.
-    if empty == "zero":
+    # n == 0 cells hold no value at all -- mu = 0 there is a placeholder, not
+    # data. This substitution must apply at EVERY lambda including 0, otherwise
+    # the empty-cell correction is only reachable when shrinkage is also active
+    # and the ablation row is vacuous. A cell with n == 1 does have a usable
+    # value (CARPRT uses it), so only n == 0 is touched here.
+    if empty == "mean":
+        mu_t = torch.where(n == 0, mu_bar.expand_as(mu_t), mu_t)
+    else:                                    # "zero" = CARPRT's own behaviour
         mu_t = torch.where(n == 0, torch.zeros_like(mu_t), mu_t)
 
     return {"mu_tilde": mu_t, "shrinkage": b, "mu_bar": mu_bar, "tau2": tau2}
+
+
+def tstat_scores(
+    mu: torch.Tensor,
+    se2: torch.Tensor,
+    unestimated: torch.Tensor,
+    mu_bar: torch.Tensor,
+    rescale_to: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Precision-weighted deviation: (mu - mu_bar) / se.
+
+    Shrinkage cannot concentrate weights -- B <= 1 always, so it only ever
+    reduces the spread across prompts and flattens the softmax toward MPE. To
+    concentrate while still respecting uncertainty the operator has to be able to
+    AMPLIFY, and 1/se is unbounded above. A cell is promoted when its deviation
+    from the class mean is large relative to its own noise, not merely large.
+
+    Cells with no variance estimate get 0, i.e. placed at the class mean: no
+    evidence, no deviation.
+    """
+    t = (mu - mu_bar) / se2.clamp_min(1e-12).sqrt()
+    t = torch.where(unestimated, torch.zeros_like(t), t)
+    if rescale_to is not None:
+        # Match the reference per-class spread so a fixed tau keeps meaning the
+        # same thing; isolates "is this a better ranking" from "did the
+        # temperature change".
+        t = t / t.std(dim=0, keepdim=True).clamp_min(1e-8) \
+            * rescale_to.std(dim=0, keepdim=True)
+    return t
 
 
 # --------------------------------------------------------------------------
@@ -213,12 +246,18 @@ def posterior_weights(
     beta: float = 0.0,
     temp: float = 1.0,
     empty: str = "mean",
+    score_mode: str = "mean",
 ) -> Dict[str, torch.Tensor]:
-    """Full estimator: moments -> shrinkage -> prior -> softmax over prompts."""
+    """Full estimator: moments -> (shrinkage | t-stat) -> prior -> softmax."""
     mu, se2, unest = cell_statistics(s1, s2, n)
     sh = shrink(mu, se2, unest, n, lam, empty)
-    scores = sh["mu_tilde"] if delta is None else apply_prior(
-        sh["mu_tilde"], delta, beta)
+
+    if score_mode == "tstat":
+        base = tstat_scores(mu, se2, unest, sh["mu_bar"], rescale_to=mu)
+    else:
+        base = sh["mu_tilde"]
+
+    scores = base if delta is None else apply_prior(base, delta, beta)
     w = F.softmax(scores / temp, dim=0)
     return {"weights": w, "scores": scores, "shrinkage": sh["shrinkage"],
             "unestimated_frac": float(unest.float().mean())}
