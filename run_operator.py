@@ -61,6 +61,20 @@ from promptop import manifold as manifold_mod
 from utils import build_test_data_loader, clip_classifier
 
 
+# utils.build_test_data_loader dispatches ImageNet and its variants on the ids
+# I/A/V/R/S, while promptop.corpus and datasets.dataset_list use the spelled-out
+# registry names. Accept either so --targets imagenet does not fail with an
+# unhelpful "Dataset is not from the chosen list".
+LOADER_ALIAS = {"imagenet": "I", "imagenet-a": "A", "imagenet_a": "A",
+                "imagenet-v": "V", "imagenet_v": "V", "imagenet-r": "R",
+                "imagenet_r": "R", "imagenet-s": "S", "imagenet_s": "S",
+                "imagenet-sketch": "S"}
+
+
+def loader_id(name):
+    return LOADER_ALIAS.get(name.lower(), name)
+
+
 def get_args():
     p = argparse.ArgumentParser(description="Prompt-operator pipeline.")
     p.add_argument("command", choices=["fit", "classify", "all", "sweep", "residual", "oracle",
@@ -319,7 +333,7 @@ def run_diagnose(args, clip_model, logit_scale, m_fit, z_fit, m_tgt, z_tgt,
         banner(f"{name}")
         try:
             loader, classnames, _ = build_test_data_loader(
-                name, args.data_root, preprocess)
+                loader_id(name), args.data_root, preprocess)
         except Exception as exc:                                   # noqa: BLE001
             print(f"  [skip] {type(exc).__name__}: {exc}")
             continue
@@ -407,7 +421,7 @@ def run_dose(args, clip_model, logit_scale, m_fit, z_fit, m_tgt, z_tgt,
 
     banner(f"downstream zero-shot: {args.target}")
     loader, classnames, _ = build_test_data_loader(
-        args.target, args.data_root, preprocess)
+        loader_id(args.target), args.data_root, preprocess)
     print("  encoding images once ...")
     img_f, targets = infer_mod.encode_images(loader, clip_model)
     tf = clip_classifier(classnames, TEMPLATES, clip_model)
@@ -527,7 +541,7 @@ def run_validate(args, clip_model, logit_scale, m_fit, z_fit, m_tgt, z_tgt,
         banner(f"{name}")
         try:
             loader, classnames, _ = build_test_data_loader(
-                name, args.data_root, preprocess)
+                loader_id(name), args.data_root, preprocess)
         except Exception as exc:                                   # noqa: BLE001
             print(f"  [skip] {type(exc).__name__}: {exc}")
             continue
@@ -608,7 +622,7 @@ def run_bayes(args, clip_model, logit_scale, m_fit, z_fit, m_tgt, z_tgt,
 
     banner(f"downstream zero-shot: {args.target}")
     loader, classnames, _ = build_test_data_loader(
-        args.target, args.data_root, preprocess)
+        loader_id(args.target), args.data_root, preprocess)
     print("  encoding images once ...")
     img_f, targets = infer_mod.encode_images(loader, clip_model)
     tf = clip_classifier(classnames, TEMPLATES, clip_model)
@@ -823,7 +837,7 @@ def run_learn(args, clip_model, logit_scale, m_fit, z_fit, m_tgt, z_tgt,
 
     banner(f"downstream zero-shot: {args.target}")
     loader, classnames, _ = build_test_data_loader(
-        args.target, args.data_root, preprocess)
+        loader_id(args.target), args.data_root, preprocess)
     print("  encoding images once ...")
     img_f, targets = infer_mod.encode_images(loader, clip_model)
     tf_true = clip_classifier(classnames, TEMPLATES, clip_model)
@@ -916,7 +930,7 @@ def run_characterize(args, clip_model, logit_scale, m_fit, z_fit, m_tgt, z_tgt,
 
     banner(f"downstream zero-shot: {args.target}")
     loader, classnames, _ = build_test_data_loader(
-        args.target, args.data_root, preprocess)
+        loader_id(args.target), args.data_root, preprocess)
     print("  encoding images once ...")
     img_f, targets = infer_mod.encode_images(loader, clip_model)
     tf_true = clip_classifier(classnames, TEMPLATES, clip_model)
@@ -1004,7 +1018,7 @@ def run_oracle(args, clip_model, logit_scale, m_fit, z_fit, m_tgt, z_tgt,
 
     banner(f"downstream zero-shot: {args.target}")
     loader, classnames, _ = build_test_data_loader(
-        args.target, args.data_root, preprocess)
+        loader_id(args.target), args.data_root, preprocess)
     print("  encoding images once ...")
     img_f, targets = infer_mod.encode_images(loader, clip_model)
     tf_true = clip_classifier(classnames, TEMPLATES, clip_model)
@@ -1129,7 +1143,7 @@ def run_residual(args, clip_model, logit_scale, m_fit, z_fit, m_tgt, z_tgt,
 
     banner(f"downstream zero-shot: {args.target}")
     loader, classnames, _ = build_test_data_loader(
-        args.target, args.data_root, preprocess)
+        loader_id(args.target), args.data_root, preprocess)
     print("  encoding images once ...")
     img_f, targets = infer_mod.encode_images(loader, clip_model)
     tf_true = clip_classifier(classnames, TEMPLATES, clip_model)
@@ -1224,7 +1238,7 @@ def run_sweep(args, clip_model, logit_scale, m_fit, z_fit, m_tgt, z_tgt,
 
     banner(f"downstream zero-shot: {args.target}")
     loader, classnames, _ = build_test_data_loader(
-        args.target, args.data_root, preprocess)
+        loader_id(args.target), args.data_root, preprocess)
     print("  encoding images once ...")
     img_f, targets = infer_mod.encode_images(loader, clip_model)
 
@@ -1474,7 +1488,7 @@ def main():
     if args.command in ("classify", "all"):
         banner(f"downstream zero-shot: {args.target}")
         loader, classnames, _ = build_test_data_loader(
-            args.target, args.data_root, preprocess)
+            loader_id(args.target), args.data_root, preprocess)
 
         if len(classnames) != len(tgt_corpus):
             raise SystemExit(
