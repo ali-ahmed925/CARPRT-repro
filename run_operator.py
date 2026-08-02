@@ -26,6 +26,10 @@
     dose      dose-response: hold C, the prompt pool and the evaluation set fixed
               and vary only how many unlabeled images estimate the weights, to
               test the count mechanism causally on a single dataset
+    diagnose  1) held-out oracle per dataset, so the headroom column stops being
+              inflated by oracle overfitting; 2) oracle top-k SET scored with
+              UNIFORM weights, separating "which prompts" from "what weights",
+              plus top-k overlap between CARPRT's ranking and the oracle's
     sweep     model-complexity ladder: identity / additive / affine / low-rank at
               several ranks / full ridge / Procrustes, each scored against its
               parameter cost, to see how much operator the gain actually needs
@@ -61,7 +65,7 @@ def get_args():
     p = argparse.ArgumentParser(description="Prompt-operator pipeline.")
     p.add_argument("command", choices=["fit", "classify", "all", "sweep", "residual", "oracle",
                             "characterize", "learn", "bayes",
-                            "validate", "dose"])
+                            "validate", "dose", "diagnose"])
     p.add_argument("--fit-datasets", type=str, default="imagenet",
                    help="Slash-separated corpus for fitting, e.g. 'imagenet/sun397'.")
     p.add_argument("--target", type=str, default="oxford_pets",
@@ -94,6 +98,9 @@ def get_args():
                    help="v1 (default): original scoring; reproduces all numbers "
                         "generated before 2026-08-02. v2: alpha=0 is bit-exact "
                         "against CARPRT.")
+    p.add_argument("--topk-list", dest="topk_list", type=str,
+                   default="3,6,10,25",
+                   help="Set sizes for the selection-vs-magnitudes split.")
     p.add_argument("--dose-mode", dest="dose_mode", type=str,
                    default="images", choices=["images", "classes"],
                    help="images: vary how many images estimate the weights. "
@@ -298,6 +305,87 @@ def _dose_classes(args, tf, img_f, targets, classnames, alphas, seeds, results):
         else:
             print(f"\n  >>> effect moves the WRONG way in C ({e_hi:+.2f} -> {e_lo:+.2f}).")
     results["dose_classes"] = rows
+    return results
+
+
+def run_diagnose(args, clip_model, logit_scale, m_fit, z_fit, m_tgt, z_tgt,
+                 preprocess, results):
+    """How much headroom is real, and is the failure selection or magnitudes?"""
+    from promptop import oracle as oracle_mod
+    from promptop import diagnose as dg
+
+    rows, topk_all = [], {}
+    for name in [d for d in args.targets.split("/") if d]:
+        banner(f"{name}")
+        try:
+            loader, classnames, _ = build_test_data_loader(
+                name, args.data_root, preprocess)
+        except Exception as exc:                                   # noqa: BLE001
+            print(f"  [skip] {type(exc).__name__}: {exc}")
+            continue
+
+        img_f, targets = infer_mod.encode_images(loader, clip_model)
+        tf = clip_classifier(classnames, TEMPLATES, clip_model)
+        n, p, c = img_f.shape[0], len(TEMPLATES), len(classnames)
+        gb = oracle_mod.estimate_bytes(n, p, c)
+        if gb > 4.0:
+            print(f"  [skip] similarity tensor would need {gb:.1f} GB")
+            del img_f, targets, tf
+            torch.cuda.empty_cache()
+            continue
+
+        sim = oracle_mod.similarity_tensor(img_f, tf, args.chunk)
+        w_carprt = infer_mod.carprt_weights(img_f, tf, args.temp, args.chunk)
+        _, theta0 = infer_mod.carprt_weights_split_value(
+            img_f, tf, tf, args.temp, args.chunk)
+        base = oracle_mod._accuracy(sim, w_carprt, targets)
+
+        r = dg.held_out_headroom(sim, targets, theta0, base, args.temp,
+                                 args.oracle_steps, args.oracle_lr, args.seed)
+        rows.append({"dataset": name, **r})
+        print(f"  {c} classes, {n} images, {r['params_per_image']:.2f} oracle "
+              f"params/image")
+        print(f"  CARPRT {base:.2f} | oracle full {r['oracle_full']:.2f} "
+              f"({r['headroom_full']:+.2f}) | oracle HELD-OUT "
+              f"{r['oracle_heldout']:.2f} ({r['headroom_heldout']:+.2f}) | "
+              f"overfit gap {r['overfit_gap']:.2f}")
+
+        w_or, _, _ = oracle_mod.oracle_optimal_w(
+            sim, targets, theta0, args.temp, args.oracle_steps, args.oracle_lr)
+        tk = dg.topk_set_scores(sim, targets, w_or, w_carprt,
+                                [int(x) for x in args.topk_list.split(",") if x])
+        topk_all[name] = {"rows": tk, "carprt": base, "oracle": r["oracle_full"]}
+
+        del sim, img_f, targets, tf, w_carprt, w_or
+        torch.cuda.empty_cache()
+
+    banner("1. HOW MUCH HEADROOM IS REAL")
+    print("  The oracle fits P*C parameters on N images. Where that ratio is large")
+    print("  it memorises the test set, so the full-fit headroom is inflation.\n")
+    hdr = (f"{'dataset':<16}{'params':>9}{'images':>8}{'par/img':>9}"
+           f"{'CARPRT':>9}{'orc full':>9}{'head':>9}{'orc held':>10}"
+           f"{'head':>10}{'overfit':>9}")
+    print(hdr); print("-" * len(hdr))
+    for r in rows:
+        dg.print_headroom(r, r["dataset"])
+    if rows:
+        real = sorted(rows, key=lambda r: -r["headroom_heldout"])
+        print(f"\n  largest REAL headroom: " + ", ".join(
+            f"{r['dataset']} {r['headroom_heldout']:+.1f}" for r in real[:3]))
+        print(f"  smallest:              " + ", ".join(
+            f"{r['dataset']} {r['headroom_heldout']:+.1f}" for r in real[-3:]))
+
+    banner("2. SELECTION OR MAGNITUDES?")
+    print("  'oracle set + UNIFORM' is the key column: how far you get from knowing")
+    print("  only WHICH prompts matter, with no magnitude information at all.")
+    print("  'CARPRT set + uniform' asks whether CARPRT can identify that set.\n")
+    for name, blk in topk_all.items():
+        print(f"--- {name} ---")
+        dg.print_topk(blk["rows"], blk["carprt"], blk["oracle"])
+        print()
+
+    results["headroom"] = rows
+    results["topk"] = topk_all
     return results
 
 
@@ -1277,14 +1365,16 @@ def main():
     print(f"  M_tgt {tuple(m_tgt.shape)}  Z_tgt {tuple(z_tgt.shape)}")
 
     if args.command in ("sweep", "residual", "oracle", "characterize",
-                        "learn", "bayes", "validate", "dose"):
+                        "learn", "bayes", "validate", "dose",
+                        "diagnose"):
         runner = {"sweep": run_sweep, "residual": run_residual,
                   "oracle": run_oracle,
                   "characterize": run_characterize,
                   "learn": run_learn,
                   "bayes": run_bayes,
                   "validate": run_validate,
-                  "dose": run_dose}[args.command]
+                  "dose": run_dose,
+                  "diagnose": run_diagnose}[args.command]
         runner(args, clip_model, logit_scale, m_fit, z_fit, m_tgt, z_tgt,
                preprocess, results)
         print(f"\ndone in {time.time() - t0:.1f}s")

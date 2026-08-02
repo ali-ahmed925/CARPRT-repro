@@ -3,34 +3,39 @@
 Research directions that move past scalar reweighting of prompt–class similarities.
 Written 2026-08-01. Self-contained: assumes no memory of the conversation that produced it.
 
-> ## STATUS — read [FINDINGS.md](FINDINGS.md) first
+> ## STATUS (2026-08-02) — read [FINDINGS.md](FINDINGS.md) first
 >
-> **Idea 2 (prompt operators) has been implemented and closed.** The hypothesis is
-> confirmed — prompts really do act as operators (0.916 held-out centred cosine, `{}`
-> recovering $T=I$, a ~16-dimensional operator manifold) — and it does not help:
-> synthesized embeddings cost −5.61 accuracy, and a 512-parameter additive shift captures
-> 82% of the operator's benefit against 262,144 parameters.
+> **Idea 2 is closed. Six method attempts have now been made and measured across six
+> datasets.** The operator hypothesis is *confirmed* (0.916 held-out centred cosine, `{}`
+> recovering $T=I$, a ~16-dimensional manifold) and *useless* (synthesized embeddings cost
+> −5.61; a 512-parameter additive shift captures 82% of the benefit against 262,144).
 >
-> Measuring *why* produced something more useful than the idea itself. On Oxford Pets:
+> What the measurement produced is worth more than any of the attempts:
 >
-> - **+3.57** points of generalisable headroom exist above CARPRT, and **70%** of it is
->   class-specific rather than per-prompt.
+> - **The ceiling is large and generalises**: +20.8 on EuroSAT, +19.6 on DTD, +13.1 on
+>   Flowers by full-fit oracle; +3.57 generalisable on Pets. Nobody in this literature has
+>   measured it.
 > - **Pseudo-labels are not the bottleneck** (+0.14 with ground truth). Eq. 10's functional
 >   form is.
-> - Optimal weights are **sparse** (6.2 effective prompts of 247) where CARPRT's are diffuse
->   (95.6) — but reproducing that sparsity gains nothing, because the missing information is
->   *which* prompts, not how many.
-> - Five independent attacks all land inside one standard error. **The information needed is
->   not in the $(N,P,C)$ similarity tensor.**
+> - The gap is **70% class-specific, 5% class-agnostic** — which rules out anything WPE-shaped.
+> - Optimal weights are **15× sparser** than CARPRT's, but reproducing that sparsity gains
+>   nothing: the missing information is *which* prompts, not how many.
+> - **CARPRT improves with less unlabeled data** (Pets 89.48→90.24, EuroSAT 55.12→56.76),
+>   because empty cells implicitly sparsify. Unreported property of the baseline.
+> - One large **unexplained** gain: EuroSAT +6.30 (p=4e−53), robust to 32× subsampling. Two
+>   candidate explanations — count density and class count — were each refuted by controlled
+>   experiment. CIFAR-10 at matched C=10 gives −0.11.
 >
-> **Consequence for this document.** Ideas 1 and 3 below operate on that same tensor and are
-> therefore likely subject to the same ceiling. **Idea 4 (Gromov–Wasserstein) is the one that
-> escapes it**, since it introduces image-manifold structure — a signal none of the tested
-> methods use. It is now the recommended direction, and the findings supply the evidence it
-> previously lacked.
+> **Consequence for this document.** Ideas 1 and 3 read the same $(N,P,C)$ tensor that six
+> attempts have now failed to extract more from. They are *not* bounded by the measured
+> weight-family ceiling (both leave that family), but the base rate is discouraging.
+> **Idea 4 (Gromov–Wasserstein) remains the only one that introduces a genuinely new signal**
+> — image-manifold structure, which CARPRT discards by collapsing each image to an `argmax`.
+> The findings now supply the evidence it previously lacked.
 >
-> Before acting on any of this, re-run `oracle` and `characterize` on DTD and Caltech101:
-> every number above is from a single dataset with CARPRT's largest margin in the paper.
+> **Before designing anything new**, note the two negative results that constrain the space:
+> better *inputs* to Eq. 10 do not help (§2, §5e), and better *structure* in the output weights
+> does not help (§4, §5f). What has never been tried is a different *information source*.
 
 ---
 

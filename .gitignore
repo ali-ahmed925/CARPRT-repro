@@ -10,3 +10,6 @@ venv/
 # prompt-operator embedding cache (hundreds of MB of .pt tensors)
 .operator_cache/
 *.json.results
+
+# experiment outputs (regenerable)
+results_*
