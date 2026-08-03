@@ -30,6 +30,10 @@
               inflated by oracle overfitting; 2) oracle top-k SET scored with
               UNIFORM weights, separating "which prompts" from "what weights",
               plus top-k overlap between CARPRT's ranking and the oracle's
+    select    label-free prompt SELECTION: score each selector's top-k with
+              UNIFORM weights, since magnitudes are worth only ~20%. Compares
+              CARPRT's own ranking, a pseudo-label-learned ranking, bootstrap
+              stability selection, and the label-fitted oracle as the ceiling
     sweep     model-complexity ladder: identity / additive / affine / low-rank at
               several ranks / full ridge / Procrustes, each scored against its
               parameter cost, to see how much operator the gain actually needs
@@ -79,7 +83,8 @@ def get_args():
     p = argparse.ArgumentParser(description="Prompt-operator pipeline.")
     p.add_argument("command", choices=["fit", "classify", "all", "sweep", "residual", "oracle",
                             "characterize", "learn", "bayes",
-                            "validate", "dose", "diagnose"])
+                            "validate", "dose", "diagnose",
+                            "select"])
     p.add_argument("--fit-datasets", type=str, default="imagenet",
                    help="Slash-separated corpus for fitting, e.g. 'imagenet/sun397'.")
     p.add_argument("--target", type=str, default="oxford_pets",
@@ -112,6 +117,8 @@ def get_args():
                    help="v1 (default): original scoring; reproduces all numbers "
                         "generated before 2026-08-02. v2: alpha=0 is bit-exact "
                         "against CARPRT.")
+    p.add_argument("--n-boot", dest="n_boot", type=int, default=20,
+                   help="Bootstrap draws for the stability selector.")
     p.add_argument("--topk-list", dest="topk_list", type=str,
                    default="3,6,10,25",
                    help="Set sizes for the selection-vs-magnitudes split.")
@@ -319,6 +326,96 @@ def _dose_classes(args, tf, img_f, targets, classnames, alphas, seeds, results):
         else:
             print(f"\n  >>> effect moves the WRONG way in C ({e_hi:+.2f} -> {e_lo:+.2f}).")
     results["dose_classes"] = rows
+    return results
+
+
+def run_select(args, clip_model, logit_scale, m_fit, z_fit, m_tgt, z_tgt,
+               preprocess, results):
+    """Can a label-free selector find the ~3 prompts per class that matter?"""
+    from promptop import oracle as oracle_mod
+    from promptop import select as sel
+    from promptop import stats as st
+
+    ks = [int(x) for x in args.topk_list.split(",") if x]
+    all_rows = {}
+
+    for name in [d for d in args.targets.split("/") if d]:
+        banner(f"{name}")
+        try:
+            loader, classnames, _ = build_test_data_loader(
+                loader_id(name), args.data_root, preprocess)
+        except Exception as exc:                                   # noqa: BLE001
+            print(f"  [skip] {type(exc).__name__}: {exc}")
+            continue
+
+        img_f, targets = infer_mod.encode_images(loader, clip_model)
+        tf = clip_classifier(classnames, TEMPLATES, clip_model)
+        n, p, c = img_f.shape[0], len(TEMPLATES), len(classnames)
+        gb = oracle_mod.estimate_bytes(n, p, c)
+        if gb > 4.0:
+            print(f"  [skip] similarity tensor would need {gb:.1f} GB")
+            del img_f, targets, tf
+            torch.cuda.empty_cache()
+            continue
+
+        sim = oracle_mod.similarity_tensor(img_f, tf, args.chunk)
+        w_carprt = infer_mod.carprt_weights(img_f, tf, args.temp, args.chunk)
+        _, theta0 = infer_mod.carprt_weights_split_value(
+            img_f, tf, tf, args.temp, args.chunk)
+        base = oracle_mod._accuracy(sim, w_carprt, targets)
+        w_oracle, orc, _ = oracle_mod.oracle_optimal_w(
+            sim, targets, theta0, args.temp, args.oracle_steps, args.oracle_lr)
+
+        print(f"  building selectors ({args.n_boot} bootstrap draws) ...")
+        selectors = {
+            "carprt": w_carprt,
+            "pseudo": sel.pseudo_label_scores(sim, w_carprt, theta0, args.temp,
+                                              args.learn_steps, args.oracle_lr),
+            "stability": sel.stability_scores(img_f, tf, max(ks), args.n_boot,
+                                              args.temp, args.chunk, args.seed),
+            "oracle": w_oracle,
+        }
+        rows = sel.evaluate_selectors(sim, targets, selectors, w_oracle, ks)
+        print()
+        sel.print_selectors(rows, base, orc, ks)
+
+        # paired test for the best label-free selector at its best k
+        free = [r for r in rows if r["selector"] != "oracle"]
+        best = max(free, key=lambda r: r["acc"])
+        w_best = sel.uniform_over_topk(selectors[best["selector"]], best["k"])
+        pr_b = infer_mod._scores(img_f, tf, w_carprt).argmax(1)
+        pr_n = infer_mod._scores(img_f, tf, w_best).argmax(1)
+        m = st.mcnemar(pr_b, pr_n, targets, "CARPRT", best["selector"])
+        print(f"\n  best label-free: {best['selector']} at k={best['k']} -> "
+              f"{best['acc']:.2f} ({best['acc'] - base:+.2f} vs CARPRT, "
+              f"b={m['b']} c={m['c']}, p={m['p_exact']:.2e} "
+              f"{st.stars(m['p_exact'])})")
+
+        all_rows[name] = {"rows": rows, "carprt": base, "oracle": orc,
+                          "best": best, "mcnemar": m}
+        del sim, img_f, targets, tf, w_carprt, w_oracle, selectors
+        torch.cuda.empty_cache()
+
+    banner("SUMMARY — can a label-free selector beat CARPRT?")
+    hdr = (f"{'dataset':<16}{'CARPRT':>9}{'best free':>11}{'k':>4}"
+           f"{'delta':>8}{'p':>10}{'oracle':>9}{'captured':>10}")
+    print(hdr); print("-" * len(hdr))
+    deltas = []
+    for name, blk in all_rows.items():
+        b, m = blk["best"], blk["mcnemar"]
+        d = b["acc"] - blk["carprt"]
+        cap = 100 * d / max(blk["oracle"] - blk["carprt"], 1e-9)
+        deltas.append(d)
+        print(f"{name:<16}{blk['carprt']:>9.2f}{b['acc']:>11.2f}{b['k']:>4}"
+              f"{d:>+8.2f}{m['p_exact']:>10.1e}{blk['oracle']:>9.2f}"
+              f"{cap:>9.0f}%  {b['selector']}")
+    if deltas:
+        mean_d = sum(deltas) / len(deltas)
+        wins = sum(1 for d in deltas if d > 0)
+        print(f"\n  mean {mean_d:+.2f} over {len(deltas)} datasets, "
+              f"positive on {wins}/{len(deltas)}")
+        print("  'captured' = share of the oracle's headroom reached with NO labels")
+    results["select"] = all_rows
     return results
 
 
@@ -1380,7 +1477,7 @@ def main():
 
     if args.command in ("sweep", "residual", "oracle", "characterize",
                         "learn", "bayes", "validate", "dose",
-                        "diagnose"):
+                        "diagnose", "select"):
         runner = {"sweep": run_sweep, "residual": run_residual,
                   "oracle": run_oracle,
                   "characterize": run_characterize,
@@ -1388,7 +1485,8 @@ def main():
                   "bayes": run_bayes,
                   "validate": run_validate,
                   "dose": run_dose,
-                  "diagnose": run_diagnose}[args.command]
+                  "diagnose": run_diagnose,
+                  "select": run_select}[args.command]
         runner(args, clip_model, logit_scale, m_fit, z_fit, m_tgt, z_tgt,
                preprocess, results)
         print(f"\ndone in {time.time() - t0:.1f}s")

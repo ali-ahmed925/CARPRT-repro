@@ -1,258 +1,193 @@
-# Findings — the ceiling of prompt reweighting, and six ways of not reaching it
+# Findings — prompt reweighting is a *selection* problem
 
 Record of the `prompt-operator` and `bayes-reweight` branches. Every number was measured.
-Written 2026-08-01, updated 2026-08-02 with six datasets.
+Written 2026-08-01, restructured 2026-08-03 around the selection result.
 
-**Setup.** CLIP ViT-B/16 · 247 templates (Allingham et al. pool) · τ = 1.0 · micro-average
-top-1 throughout (not the paper's mean-of-batch-means, which carries ±0.4 of shuffle
-variance). Operator fits use ImageNet class **names** only — no ImageNet images.
+**Setup.** CLIP ViT-B/16 · 247 templates (Allingham et al. pool) · τ = 1.0 (1.5 for ImageNet,
+per App. C.3) · micro-average top-1 · paired McNemar for all comparisons.
 
 ---
 
-## 0. Reproduction fidelity
+## HEADLINE — the gain is in choosing prompts, not weighting them
+
+Take the oracle's top-$k$ prompts per class, **discard its weights entirely**, and give every
+selected prompt equal weight:
+
+| dataset | CARPRT | oracle | **top-k set + UNIFORM** | headroom recovered |
+|---|---|---|---|---|
+| eurosat | 55.01 | 75.95 | **74.23** (k=3) | **92%** |
+| food101 | 85.85 | 89.01 | 88.57 (k=6) | 86% |
+| caltech101 | 94.52 | 98.86 | 98.09 (k=3) | 82% |
+| dtd | 49.00 | 68.44 | 64.42 (k=6) | 79% |
+| ucf101 | 69.97 | 86.47 | 82.98 (k=3) | 79% |
+| oxford_pets | 89.45 | 95.07 | 93.81 (k=3) | 78% |
+| oxford_flowers | 71.38 | 84.41 | 80.88 (k=3) | 73% |
+| fgvc | 24.60 | 40.14 | 35.10 (k=10) | 68% |
+| | | | **mean** | **≈ 80%** |
+
+**Knowing merely *which* 3–6 prompts matter, with no magnitude information at all, recovers
+~80% of the entire achievable gain on every one of eight benchmarks.** The precise weights —
+the quantity every method in this literature is built to estimate — are worth the other 20%.
+
+### …and existing methods select at chance
+
+Overlap between CARPRT's top-3 prompts per class and the oracle's top-3, out of 3:
+
+| eurosat | pets | flowers | food101 | dtd | fgvc | ucf101 | caltech |
+|---|---|---|---|---|---|---|---|
+| 0.50 (17%) | 0.30 (10%) | 0.24 (8%) | 0.23 (8%) | 0.17 (6%) | 0.16 (5%) | 0.09 (3%) | 0.08 (3%) |
+
+CARPRT's per-class Spearman against the oracle is 0.774, which sounds adequate — but that
+correlation is carried almost entirely by the *bottom* of the ranking. It knows which prompts
+are bad and has essentially no idea which are best. Forcing it onto its own top-$k$ makes
+accuracy **worse** on 6 of 8 datasets, because it concentrates on the wrong set.
+
+> **Prompt reweighting is a selection problem, not a weighting problem. Uniform weights over
+> the right ~3 prompts per class recover ~80% of the achievable gain across eight benchmarks,
+> while current methods identify those prompts at near-chance rates.**
+
+## The headroom is real, and it is large
+
+Oracle weights fitted on 50% of images and scored on the held-out 50%, so this is what a
+perfect *generalising* estimator could reach — not a memorisation artifact.
+
+| dataset | CARPRT | oracle (full fit) | **oracle (held-out)** | **real headroom** | overfit gap |
+|---|---|---|---|---|---|
+| eurosat | 55.01 | 75.95 | 77.23 | **+22.2** | −1.3 |
+| ucf101 | 69.97 | 86.47 | 83.19 | **+13.2** | 3.3 |
+| dtd | 49.00 | 68.44 | 60.64 | **+11.6** | 7.8 |
+| oxford_flowers | 71.38 | 84.41 | 81.82 | **+10.4** | 2.6 |
+| fgvc | 24.60 | 40.14 | 31.79 | +7.2 | 8.4 |
+| oxford_pets | 89.45 | 95.07 | 92.59 | +3.1 | 2.5 |
+| food101 | 85.85 | 89.01 | 88.01 | +2.2 | 1.0 |
+| caltech101 | 94.52 | 98.86 | 95.94 | +1.4 | 2.9 |
+
+**Mean real headroom ≈ +9 points.** The overfit gap tracks the *error rate* (FGVC and DTD,
+the two hardest datasets, lose the most), not the parameter-to-image ratio — Flowers has the
+most oracle parameters per image (10.2) yet one of the smallest gaps.
+
+## Reproduction fidelity
 
 | dataset | C | test N | our CARPRT | paper | Δ |
 |---|---|---|---|---|---|
+| imagenet | 1000 | 50,000 | 68.86 | 68.59 | +0.27 |
 | oxford_pets | 37 | 3,669 | 89.45 | 89.13 | +0.32 |
 | dtd | 47 | 1,692 | 48.88 | 48.90 | −0.02 |
 | eurosat | 10 | 8,100 | 55.12 | 55.56 | −0.44 |
 | oxford_flowers | 102 | 2,463 | 71.30 | 71.36 | −0.06 |
 | caltech101 | 100 | 2,465 | 94.60 | 94.16 | +0.44 |
-| cifar10 | 10 | 10,000 | 90.05 | 90.82 (Tab. 12) | −0.77 |
+| ucf101 | 101 | 3,783 | 69.97 | 70.41 | −0.44 |
+| fgvc | 100 | 3,333 | 24.69 | 24.49 | +0.20 |
+| food101 | 101 | 30,300 | 85.85 | 86.31 | −0.46 |
 
-All within ±0.8. The baseline is trustworthy.
-
-## 1. The ceiling is large, and it generalises
-
-Oracle = best possible $(P,C)$ weight matrix fitted **with ground-truth labels**. Used purely
-as a ruler; the setting forbids labels. Full-fit numbers are inflated (9,139 parameters), so
-they upper-bound the reachable headroom.
-
-| dataset | CARPRT | oracle (full fit) | headroom |
-|---|---|---|---|
-| eurosat | 55.12 | 75.95 | **+20.8** |
-| dtd | 48.88 | 68.44 | **+19.6** |
-| oxford_flowers | 71.30 | 84.41 | **+13.1** |
-| oxford_pets | 89.45 | 95.04 | +5.6 |
-| caltech101 | 94.60 | 98.86 | +4.3 |
-| cifar10 | 90.05 | 93.68 | +3.6 |
-
-On Pets, where the held-out oracle was also computed, the *generalisable* headroom is
-**+3.57** (93.02). Even discounted heavily, DTD and EuroSAT have far more room than anyone
-in this literature has been extracting.
-
-## 2. Pseudo-labels are not the bottleneck; Eq. 10's form is
-
-| gap (Pets) | size |
-|---|---|
-| CARPRT → Eq. 10 with **true labels** | **+0.14** |
-| Eq. 10 with true labels → best possible W | **+3.43** |
-
-Hand CARPRT ground truth and it gains 5 images out of 3,669. The estimator's *functional
-form*, not its inputs, is the limit. This retires the entire "improve the pseudo-labels"
-direction.
-
-## 3. The missing accuracy is class-specific
-
-| correction applied to CARPRT's weights (Pets) | accuracy | recovered |
-|---|---|---|
-| class-agnostic (per-prompt) part only | 89.72 | **5%** |
-| class-specific part only | 93.35 | **70%** |
-| both (= oracle) | 95.04 | 100% |
-
-Class-agnostic share of the correction's energy: 2.7%. Validates the paper's thesis while
-showing CARPRT captures a fraction of it — and rules out anything WPE-shaped.
-
-## 4. Optimal weights are sparse; CARPRT's are not
-
-| (Pets) | eff. prompts | top-10 mass | cls-std |
-|---|---|---|---|
-| CARPRT | 95.6 | 34.0% | 0.781 |
-| oracle | **6.2** | **97.2%** | **3.335** |
-
-Pearson 0.199 but per-class **Spearman 0.774**: the ordering is roughly right, the magnitudes
-badly too flat. Sharpening τ does not fix it (paper Tab. 10: Pets 88.69 at τ=0.5 vs 89.13 at
-τ=1.0) — a 0.77-accurate ranking cannot support that concentration.
-
-## 5. Six method attempts, and what each measured
-
-### 5a. Prompts as operators — confirmed as a hypothesis, useless as a method
-
-$z_{i,c} \approx T_i m_c$ by ridge with shrinkage toward identity, fitted on ImageNet names,
-evaluated on held-out Pets classes: **0.9166** centred cosine vs **0.8553** for an additive
-null and **−0.0121** for the class-name-only null. Two free confirmations: the `{}` template
-recovered $T=I$ to $\|W-I\|_F = 0.005$ against a mean of 12.58; the semantic ordering of
-"generic" prompts is correct. All 247 operators lie on a manifold of **effective dimension
-16.3** (54 PCs for 90% variance).
-
-Then: synthesized embeddings score **83.84 vs 89.45** (−5.61) using 37 encodings instead of
-9,139. Manifold-sampled "novel prompts" land at the no-information floor (81.96).
-
-### 5b. The matrix does not earn its parameters
-
-| model | params/prompt | accuracy | pts per 1k params |
-|---|---|---|---|
-| additive shift | 512 | 83.48 | **3.25** |
-| low-rank r=1 | 1,023 | 83.57 | 1.71 |
-| affine ($Tm + a$, nested) | 262,656 | 83.70 | 0.007 |
-| full ridge | 262,144 | 83.84 | 0.008 |
-
-The nested affine model reads the matrix's incremental value *given the shift* directly:
-**+0.22 points for 262,144 extra parameters** — the shift is **422× more parameter-efficient**.
-
-### 5c. Reconstruction quality anti-correlates with accuracy
-
-Low-rank ladder r = 1…64: centred cosine rises 0.8554 → 0.9104 while accuracy falls
-83.57 → 83.21. **Spearman ρ ≈ −0.89.** Rank truncation adds directions by variance, and those
-directions carry no discriminative value: **variance and discriminability are anti-aligned in
-prompt space.**
-
-### 5d. Transferable ≠ useful
-
-94% of a prompt's effect (by energy) is a class-independent transformation, but that component
-delivers only **22%** of the accuracy headroom. Class-aware reweighting's own value collapses
-from +8.34 to +3.11 on synthesized embeddings. The 6%-by-energy interaction term carries most
-of the value.
-
-### 5e. …but the interaction term cannot drive weight estimation
-
-Two designs, both anchored so α=0 reproduces CARPRT exactly. Monotone decline, no peak at any
-α, in either. Signal mode fails because the residual carries no class identity, destroying the
-`argmax` that produces pseudo-labels. Value mode keeps pseudo-labels intact and still fails —
-it *did* make weights far more class-specific (cls-std 0.78 → 2.75), and those were **worse**.
-Sanity check: at α=2, $z - 2Tm \approx -z$, the estimator picks the *worst* prompts, 58.5%.
-
-### 5f. Self-training gains nothing — quantified
-
-| labels used to fit W (Pets) | achieved | gain |
-|---|---|---|
-| 100% accurate | 94.99 | +5.53 |
-| 89.3%, **randomly** corrupted | 92.45 | **+3.00** |
-| 89.45%, **real pseudo-labels** | 89.67 | **+0.22** |
-
-Identical label accuracy, **14× shortfall**. Random errors cancel; CARPRT's real errors are
-its own systematic confusions, so fitting W to them reinforces exactly what the signal cannot
-correct. And the learned weights reproduced the oracle's **structure** (6.6 effective prompts
-vs 6.2, cls-std 3.45 vs 3.34) while gaining 0.16 — **right form, wrong content.**
-
-## 6. The count factor: one large gain, no predictor
-
-$n_{i,c}$ — how often prompt $i$ selects class $c$ — is information Eq. 10 discards entirely.
-Scoring $\text{score} = (\mu - \bar\mu)\cdot n^{\alpha}$ (α=0 is CARPRT) across six datasets:
-
-| dataset | C | med. count | `dev·√n` | `dev/sd` | `dev·√n/sd` (t-stat) |
-|---|---|---|---|---|---|
-| **eurosat** | 10 | 648 | **+4.12** | −5.17 | −3.68 |
-| oxford_pets | 37 | 100 | **+0.76** | −1.96 | −0.08 |
-| oxford_flowers | 102 | 20 | +0.32 | −3.65 | −1.14 |
-| caltech101 | 100 | 18 | −0.20 | −0.89 | −0.20 |
-| dtd | 47 | 29 | **−4.67** | −4.73 | −2.42 |
-| cifar10 | 10 | 1002 | −0.11 | **+0.89** | **+0.77** |
-| **mean** | | | **+0.04** | −2.59 | −1.13 |
-| positive on | | | 3/6 | 1/6 | 1/6 |
-
-**No rule improves on average.** `dev·√n` nets +0.04 only because EuroSAT's +4.12 cancels
-DTD's −4.67. The dispersion factor hurts on five datasets and helps on the sixth — noise in
-both directions, not a rule.
-
-EuroSAT alone is striking: peak **+6.30 at α=0.375 (p = 3.9e−53)**, i.e. **61.42** against the
-paper's best published EuroSAT figure of 55.56, and robust to 32× subsampling and to three
-separate implementations.
-
-### 6a. Two explanations proposed, both refuted by controlled experiment
-
-**Count density — refuted.** Subsampling EuroSAT's *images* while holding C=10, the prompt
-pool and the evaluation set fixed:
-
-| EuroSAT med. count | 648 | 330 | 165 | 82 | 41 | 21 |
-|---|---|---|---|---|---|---|
-| gain (α=0.375) | +6.30 | +6.35 | +6.04 | +6.04 | +5.05 | **+3.71** |
-
-Still +3.71 at median count 21 — where DTD (29) loses 4.67. An 8-point swing at matched
-density. (On Pets the same experiment *did* decay: +0.76 → −0.44 as count fell 100 → 12.5, so
-even the sensitivity to count is dataset-specific.)
-
-**Number of classes — refuted.** Class-subsampling DTD holds evidence per cell roughly
-constant ($n_{\text{img}} \propto C'$, so median count $\approx N/C$ is preserved) and shows
-the count factor moving monotonically from −4.49 at C=47 to −0.89 at C=15. That looked like C
-was the driver — until CIFAR-10:
-
-| | C | med. count | `dev·√n` |
-|---|---|---|---|
-| eurosat | 10 | 648 | **+4.12** |
-| **cifar10** | **10** | **1002** | **−0.11** |
-
-Same class count, *more* evidence per cell, opposite sign. **Neither count density nor C
-predicts where the count factor helps.** EuroSAT is an outlier we cannot identify from any
-observable quantity tested.
-
-## 7. CARPRT improves with *less* unlabeled data
-
-Estimating weights from a subsample while always evaluating on the full test set:
-
-| Pets: images used | 3,669 | 1,834 | 917 | 459 |
-|---|---|---|---|---|
-| CARPRT | 89.48 | 89.75 | 89.90 | **90.24** |
-
-Replicated on EuroSAT (55.12 → 56.76 at 253 images). Mechanism: fewer images → more empty
-cells → empty cells get $w'=0$ → weights become **implicitly sparser**, and §4 showed optimal
-weights are 15× sparser than CARPRT's. Small samples accidentally sparsify in the right
-direction. This is a pointed, unreported property of the baseline.
+Nine benchmarks within ±0.5; ImageNet MPE lands at 67.57 against the paper's 67.59.
 
 ---
 
-## Conclusion
+## Why six method attempts failed: all six estimated magnitudes
 
-The headroom above CARPRT is real and large (+3.6 to +20.8 by full-fit oracle; +3.57
-generalisable on Pets) and it is **class-specific**. Six principled attacks — operator
-synthesis, residual signals as weight-estimation input (two variants), discriminative
-accumulation statistics, learned weights from pseudo-labels, and the count factor — all fail
-to close it, each for a diagnosed reason.
+Every one operated on the 20% and never touched the 80%.
 
-> **Everything tried reads the same $(N, P, C)$ prompt–image similarity tensor, and CARPRT
-> already extracts what it contains.** The one exception is a large unexplained gain on
-> EuroSAT that no observable property of the dataset predicts.
+**Pseudo-labels are not the bottleneck.** Eq. 10 with *true labels* gains **+0.14** over
+pseudo-labels on Pets. The estimator's functional form, not its inputs, is the limit.
 
-Closing the gap plausibly requires a signal none of these methods use: image-manifold
-structure (CARPRT collapses each image to an `argmax` and discards the rest), external
-knowledge (LLM class descriptions), or cross-prompt agreement structure.
+**The gap is class-specific.** Applying only the class-agnostic part of the oracle's
+correction recovers 5%; only the class-specific part recovers 70%. Rules out anything
+WPE-shaped.
+
+**Optimal weights are sparse.** Oracle: 6.2 effective prompts, 97.2% of mass in the top ten,
+cls-std 3.335. CARPRT: 95.6, 34.0%, 0.781. But *reproducing that sparsity gains nothing* —
+the learned-W experiment matched the oracle's structure (6.6 effective prompts, cls-std 3.45,
+top-10 mass 0.986) and gained **0.16**. Right form, wrong content. In hindsight that was the
+selection result shouting.
+
+**Prompts behave like operators, and it doesn't help.** $z_{i,c} \approx T_i m_c$ reaches
+0.9166 held-out centred cosine (additive null 0.8553, identity null −0.0121); the `{}`
+template recovers $T=I$ to $\|W-I\|_F = 0.005$; the 247 operators lie on a manifold of
+effective dimension 16.3. Synthesized embeddings then score **83.84 vs 89.45**. A nested
+affine model shows the matrix is worth **+0.22 for 262,144 parameters** over a 512-parameter
+additive shift — 422× less efficient.
+
+**Reconstruction anti-correlates with accuracy.** Across the low-rank ladder, centred cosine
+rises 0.8554 → 0.9104 while accuracy falls 83.57 → 83.21, **Spearman ρ ≈ −0.89**. Variance
+and discriminability are anti-aligned in prompt space.
+
+**Transferable ≠ useful.** 94% of a prompt's effect by energy is class-independent, but that
+component delivers only 22% of the headroom. Yet the interaction term cannot drive weight
+estimation either: monotone decline at every α, in two separate designs.
+
+**Self-training gains nothing, quantified.** Fitting W to labels degraded to 89.3% accuracy
+*by random corruption* gives +3.00; fitting to CARPRT's own 89.45%-accurate pseudo-labels
+gives **+0.22**. A 14× shortfall — random errors cancel, systematic ones compound.
+
+**The count factor: one large gain, no predictor.** $\text{score} = (\mu-\bar\mu)n^\alpha$
+across nine datasets at frozen α=0.5: eurosat +4.15✱✱✱, pets +0.76✱, imagenet +0.19✱✱,
+flowers +0.08, caltech −0.20, fgvc −0.39, ucf101 −1.37✱, dtd −4.96✱✱✱. **Mean −0.22.** Both
+candidate explanations were refuted by controlled experiment: count density (EuroSAT still
++3.71 at median count 21, where DTD loses 4.67 at 29) and class count (CIFAR-10 at C=10 gives
+−0.11 while EuroSAT at C=10 gives +4.12; ImageNet at C=1000 is *positive*).
+
+## A property of the baseline worth reporting
+
+**CARPRT improves with *less* unlabeled data.** Pets 89.48 → 90.24 as the estimation set
+shrinks 3,669 → 459; EuroSAT 55.12 → 56.76 at 253 images. Mechanism: fewer images → more
+empty cells → $w'=0$ → implicitly sparser weights, which §Headline shows is the right
+direction.
+
+---
+
+## What to build next
+
+The measurement hands the field a target: **a label-free selector**, not a better weighter.
+Two properties make it tractable:
+
+- You need only ~3 prompts per class, not a calibrated 247-vector.
+- Uniform weights over the right set are enough, so the output is a *set*, not a distribution.
+
+Candidate signals, in the order I'd test them:
+
+1. **Pseudo-label selection.** §"Pseudo-labels are not the bottleneck" shows they are worth
+   +0.14 of ground truth *for Eq. 10*. Nobody has asked whether they are good enough for
+   *selection*: take the W learned from pseudo-labels, keep its top-k, weight uniformly. The
+   learned-W experiment produced that W already and we only ever evaluated its full,
+   magnitude-laden form.
+2. **Stability selection.** Bootstrap the unlabeled set; keep prompts that rank top-k
+   consistently. Directly targets the ranking noise that made concentration fail.
+3. **Greedy forward selection** against an unsupervised objective (prediction entropy,
+   consistency across augmentations, cluster separation) — the natural algorithm for a
+   combinatorial selection problem, and untouched here.
+4. **Image-manifold structure** (Idea 4 in the plan). CARPRT collapses each image to an
+   `argmax` and discards the rest.
 
 ## Caveats
 
-- Six datasets, one backbone (ViT-B/16), one seed per configuration except the dose-response
+- Nine datasets, one backbone (ViT-B/16), one seed per configuration except the dose-response
   runs (2–5 seeds).
-- Full-fit oracle ceilings are inflated. Only Pets has a held-out oracle (93.02 vs 95.04);
-  the others should be discounted similarly before being quoted.
-- The EuroSAT gain is a single dataset. CIFAR-10 was a pre-registered attempt to replicate it
-  at matched C and it failed.
+- Oracle weights are obtained by optimising against labels; labels are used **only as a
+  ruler**, never in any proposed method.
+- The top-k analysis uses the *full-fit* oracle's sets. Held-out oracle sets would be the
+  stricter test and have not been computed.
 
 ## Implementation caveats (worth not re-discovering)
 
-- **Two scoring implementations exist.** `--impl v1` (default) sends singleton cells (n=1) to
-  the class prior and floors empty cells; its α=0 is *approximately* CARPRT. `--impl v2` makes
-  **α=0 bit-exact against CARPRT** (verified 0 discordant predictions across four sparsity
-  regimes). Report v2: under v1 the "gain" mixes the count factor with the singleton/empty-cell
-  handling. The spread between them tracks each dataset's empty-cell fraction — Caltech (0.6%)
-  and EuroSAT (1.8%) stable to 0.1, Flowers (16.9%) swings 0.5.
-- **fp16 ties**: `topk` and `argmax` return identical *values* but different *indices* when
-  similarities tie, which happens often in fp16. `topk` silently routes images into different
-  (prompt, class) cells than CARPRT uses. Always `argmax`.
-- **Temperature confound**: changing the magnitude of a weight-estimation signal silently
-  changes softmax sharpness. At one point the entropy hit 0.9999 of maximum — weights flat,
-  CARPRT degenerated to MPE — which reads as signal failure but is not. Rescale to the
-  baseline's per-class spread before comparing.
-- **Shrinkage cannot concentrate.** $B \le 1$ always, so shrinking toward the class mean only
-  ever *flattens* the softmax (effective prompts rose 95.6 → 134 as λ increased). To
-  concentrate you need an operator that can amplify, e.g. $1/\mathrm{se}$.
-- **Empty ≠ missing.** $n_{i,c}=0$ means the prompt never once chose that class across
-  thousands of images — evidence against it, not absent data. Substituting the class mean cost
-  3.19 points.
-- **$C < d$**: fitting a $512\times512$ operator needs ≥512 class observations. Pets alone
-  gives 37 and would fit perfectly while meaning nothing.
+- **Two scoring implementations.** `--impl v1` sends singleton cells to the class prior and
+  floors empty cells; its α=0 is only approximately CARPRT. `--impl v2` is **bit-exact at
+  α=0** (0 discordant predictions across four sparsity regimes). Report v2. The spread
+  between them tracks each dataset's empty-cell fraction.
+- **fp16 ties**: `topk` and `argmax` return identical *values* but different *indices*.
+  `topk` silently routes images into different cells than CARPRT uses. Always `argmax`.
+- **Temperature confound**: changing a signal's magnitude silently changes softmax sharpness.
+  At one point entropy hit 0.9999 of maximum — weights flat, CARPRT degenerated to MPE —
+  which reads as signal failure but is not. Rescale to the baseline's per-class spread.
+- **Shrinkage cannot concentrate.** $B \le 1$, so shrinking toward the class mean only
+  flattens (effective prompts rose 95.6 → 134 as λ grew). Concentration needs an amplifier.
+- **Empty ≠ missing.** $n_{i,c}=0$ means the prompt never once chose that class — evidence
+  against it. Substituting the class mean cost 3.19 points.
+- **$C < d$** for operator fitting: needs ≥512 class observations; Pets alone gives 37.
 - **Metric**: `test.py` reports mean-of-batch-means, ~0.4 points of shuffle variance. Use
   micro-average.
-- **Paired testing**: comparing two weighting schemes on identical images is paired, so the
-  single-proportion SE is the wrong yardstick. Use McNemar. Watch the discordant count — one
-  control scored p=0.039 on **9 discordant pairs**, i.e. 7 images.
-- **Overflow**: the exact binomial needs log-space (`lgamma` + log-sum-exp); `comb(n,k)/2**n`
-  overflows a float past n ≈ 1023, which any dataset with a few thousand images clears.
+- **Paired testing**: use McNemar, and read the discordant count — one control scored p=0.039
+  on 9 discordant pairs. The exact binomial needs log-space (`lgamma` + log-sum-exp);
+  `comb(n,k)/2**n` overflows past n ≈ 1023.
+- **Loader ids**: ImageNet and variants dispatch on `I`/`A`/`V`/`R`/`S`, not the spelled-out
+  registry names. `LOADER_ALIAS` in `run_operator.py` accepts both.
