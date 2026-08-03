@@ -166,6 +166,89 @@ def override_curve(
 
 
 @torch.no_grad()
+def confidence(scores: torch.Tensor) -> torch.Tensor:
+    """Per class, how decisively the signal picks its favourite prompt.
+
+    z-score of the best prompt within its own class column, so it is comparable
+    across classes whose scores live on different scales.
+    """
+    mu, sd = scores.mean(dim=0), scores.std(dim=0).clamp_min(1e-9)
+    return (scores.max(dim=0).values - mu) / sd
+
+
+@torch.no_grad()
+def abstain_curve(
+    sim: torch.Tensor,
+    targets: torch.Tensor,
+    scores: torch.Tensor,
+    valid: Optional[torch.Tensor],
+    w_carprt: torch.Tensor,
+    w_oracle: torch.Tensor,
+    k: int = 10,
+    j: int = 1,
+    fracs: Tuple[float, ...] = (0.0, 0.1, 0.25, 0.5, 1.0),
+) -> List[Dict[str, float]]:
+    """Override only the most confident fraction of classes; keep CARPRT elsewhere.
+
+    At 26% precision a selector loses, because a correct pick is worth about +1.2
+    and a wrong one costs about -0.8, putting break-even near 40%. Abstention is
+    the only lever that raises precision without a better score: if confidence
+    predicts correctness, the confident classes clear 40% even though the average
+    does not. If precision is FLAT in confidence, no abstention rule can work and
+    the signal is finished.
+    """
+    p, c = w_carprt.shape
+    k, j = min(int(k), p), min(int(j), k)
+    order = w_carprt.argsort(dim=0, descending=True)
+    head = scores.topk(k, dim=0).indices
+    if valid is not None and not bool(valid.all()):
+        head = torch.where(valid.unsqueeze(0), head, order[:k])
+
+    o_mask = torch.zeros_like(w_oracle).scatter_(
+        0, w_oracle.topk(k, dim=0).indices, 1.0)
+    conf = confidence(scores)
+    if valid is not None:
+        conf = torch.where(valid, conf, torch.full_like(conf, -float("inf")))
+    rank = conf.argsort(descending=True)
+
+    rows = []
+    for f in fracs:
+        n_on = int(round(f * c))
+        on = torch.zeros(c, dtype=torch.bool, device=scores.device)
+        if n_on:
+            on[rank[:n_on]] = True
+        h = torch.where(on.unsqueeze(0), head, order[:k])
+        m = _fill_to_k(h[:j] if j else None, order, k, p, c)
+        prec = (float(o_mask.gather(0, head[:j])[:, on].mean())
+                if n_on else float("nan"))
+        rows.append({"frac": f, "n_classes": n_on,
+                     "acc": _accuracy(sim, _uniform(m), targets),
+                     "precision": prec})
+    return rows
+
+
+def print_abstain(res: Dict[str, List[Dict[str, float]]], carprt_full: float,
+                  k: int, j: int, p: int = 247) -> None:
+    fr = [r["frac"] for r in next(iter(res.values()))]
+    hdr = f"{'selector':<11}" + "".join(f"{'top ' + str(int(100 * f)) + '%':>16}"
+                                        for f in fr)
+    print(f"\n  overriding only the most confident classes (j={j}, k={k})")
+    print("  " + hdr)
+    print(f"  {'':<11}" + "".join(f"{'acc   prec':>16}" for _ in fr))
+    print("  " + "-" * len(hdr))
+    for name, rows in res.items():
+        line = f"{name:<11}"
+        for r in rows:
+            pr = "  -- " if r["n_classes"] == 0 else f"{100 * r['precision']:>4.0f}%"
+            line += f"{r['acc']:>11.2f}{pr}"
+        print("  " + line)
+    print(f"\n  CARPRT {carprt_full:.2f}   'top 0%' abstains everywhere and must "
+          f"equal CARPRT's top-{k}")
+    print(f"  break-even precision is ~40% (a right pick ~+1.2, a wrong one "
+          f"~-0.8); chance is {100 * k / p:.0f}%")
+
+
+@torch.no_grad()
 def evaluate(
     sim: torch.Tensor,
     targets: torch.Tensor,

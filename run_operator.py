@@ -121,6 +121,9 @@ def get_args():
                    help="swapcurve: overlay the pseudo-label selector on the "
                         "curve at its own overlap, to separate overlap quality "
                         "from the quality of the non-oracle picks.")
+    p.add_argument("--abstain-j", dest="abstain_j", type=int, default=1,
+                   help="selectors: how many CARPRT slots the abstention sweep "
+                        "overrides in the classes it does not abstain on.")
     p.add_argument("--n-splits", dest="n_splits", type=int, default=10,
                    help="Prompt-pool splits for the crossfit selector.")
     p.add_argument("--n-boot", dest="n_boot", type=int, default=20,
@@ -344,7 +347,7 @@ def run_selectors(args, clip_model, logit_scale, m_fit, z_fit, m_tgt, z_tgt,
     from promptop.swap import _fill_to_k, _uniform
 
     k = max(int(x) for x in args.topk_list.split(",") if x)
-    all_best, bases = {}, {}
+    all_best, bases, all_abstain = {}, {}, {}
 
     for name in [d for d in args.targets.split("/") if d]:
         banner(f"{name}")
@@ -379,10 +382,17 @@ def run_selectors(args, clip_model, logit_scale, m_fit, z_fit, m_tgt, z_tgt,
                           args.n_splits, args.seed)
         best = sl.print_table(res, base, k, p)
 
+        scores = sl.build_scores(sim, args.n_splits, args.seed)
+        ab = {nm: sl.abstain_curve(sim, targets, sc, vd, w_carprt, w_oracle,
+                                   k, args.abstain_j)
+              for nm, (sc, vd) in scores.items()}
+        sl.print_abstain(ab, base, k, args.abstain_j, p)
+        all_abstain[name] = ab
+
         # paired test for the best label-free selector at its best j
         free = {nm: b for nm, b in best.items() if nm != "ORACLE"}
         top = max(free, key=lambda nm: free[nm]["acc"])
-        sc, valid = sl.build_scores(sim, args.n_splits, args.seed)[top]
+        sc, valid = scores[top]
         order = w_carprt.argsort(dim=0, descending=True)
         head = sc.topk(k, dim=0).indices
         if valid is not None and not bool(valid.all()):
