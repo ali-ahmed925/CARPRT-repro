@@ -84,7 +84,7 @@ def get_args():
     p.add_argument("command", choices=["fit", "classify", "all", "sweep", "residual", "oracle",
                             "characterize", "learn", "bayes",
                             "validate", "dose", "diagnose",
-                            "select", "swapcurve", "stability"])
+                            "select", "swapcurve", "stability", "selectors"])
     p.add_argument("--fit-datasets", type=str, default="imagenet",
                    help="Slash-separated corpus for fitting, e.g. 'imagenet/sun397'.")
     p.add_argument("--target", type=str, default="oxford_pets",
@@ -121,6 +121,8 @@ def get_args():
                    help="swapcurve: overlay the pseudo-label selector on the "
                         "curve at its own overlap, to separate overlap quality "
                         "from the quality of the non-oracle picks.")
+    p.add_argument("--n-splits", dest="n_splits", type=int, default=10,
+                   help="Prompt-pool splits for the crossfit selector.")
     p.add_argument("--n-boot", dest="n_boot", type=int, default=20,
                    help="Bootstrap draws for the stability selector.")
     p.add_argument("--topk-list", dest="topk_list", type=str,
@@ -330,6 +332,77 @@ def _dose_classes(args, tf, img_f, targets, classnames, alphas, seeds, results):
         else:
             print(f"\n  >>> effect moves the WRONG way in C ({e_hi:+.2f} -> {e_lo:+.2f}).")
     results["dose_classes"] = rows
+    return results
+
+
+def run_selectors(args, clip_model, logit_scale, m_fit, z_fit, m_tgt, z_tgt,
+                  preprocess, results):
+    """The actual label-free methods: override CARPRT's first j slots per class."""
+    from promptop import oracle as oracle_mod
+    from promptop import selectors as sl
+    from promptop import stats as st
+    from promptop.swap import _fill_to_k, _uniform
+
+    k = max(int(x) for x in args.topk_list.split(",") if x)
+    all_best, bases = {}, {}
+
+    for name in [d for d in args.targets.split("/") if d]:
+        banner(f"{name}")
+        try:
+            loader, classnames, _ = build_test_data_loader(
+                loader_id(name), args.data_root, preprocess)
+        except Exception as exc:                                   # noqa: BLE001
+            print(f"  [skip] {type(exc).__name__}: {exc}")
+            continue
+
+        img_f, targets = infer_mod.encode_images(loader, clip_model)
+        tf = clip_classifier(classnames, TEMPLATES, clip_model)
+        n, p, c = img_f.shape[0], len(TEMPLATES), len(classnames)
+        gb = oracle_mod.estimate_bytes(n, p, c)
+        if gb > 4.0:
+            print(f"  [skip] similarity tensor would need {gb:.1f} GB")
+            del img_f, targets, tf
+            torch.cuda.empty_cache()
+            continue
+
+        sim = oracle_mod.similarity_tensor(img_f, tf, args.chunk)
+        w_carprt = infer_mod.carprt_weights(img_f, tf, args.temp, args.chunk)
+        _, theta0 = infer_mod.carprt_weights_split_value(
+            img_f, tf, tf, args.temp, args.chunk)
+        base = oracle_mod._accuracy(sim, w_carprt, targets)
+        w_oracle, orc, _ = oracle_mod.oracle_optimal_w(
+            sim, targets, theta0, args.temp, args.oracle_steps, args.oracle_lr)
+        print(f"  N={n} C={c}   CARPRT {base:.2f}   oracle {orc:.2f} "
+              f"({orc - base:+.2f})\n")
+
+        res = sl.evaluate(sim, targets, w_carprt, w_oracle, k,
+                          args.n_splits, args.seed)
+        best = sl.print_table(res, base, k, p)
+
+        # paired test for the best label-free selector at its best j
+        free = {nm: b for nm, b in best.items() if nm != "ORACLE"}
+        top = max(free, key=lambda nm: free[nm]["acc"])
+        sc, valid = sl.build_scores(sim, args.n_splits, args.seed)[top]
+        order = w_carprt.argsort(dim=0, descending=True)
+        head = sc.topk(k, dim=0).indices
+        if valid is not None and not bool(valid.all()):
+            head = torch.where(valid.unsqueeze(0), head, order[:k])
+        m = _fill_to_k(head[:free[top]["j"]], order, k, p, c)
+        pr_b = torch.einsum("npc,pc->nc", sim, w_carprt).argmax(1)
+        pr_n = torch.einsum("npc,pc->nc", sim, _uniform(m)).argmax(1)
+        mc = st.mcnemar(pr_b, pr_n, targets, "CARPRT", top)
+        print(f"\n  best label-free: {top} at j={free[top]['j']} -> "
+              f"{free[top]['acc']:.2f} ({free[top]['delta']:+.2f} vs CARPRT, "
+              f"b={mc['b']} c={mc['c']}, p={mc['p_exact']:.2e} "
+              f"{st.stars(mc['p_exact'])})")
+
+        all_best[name], bases[name] = best, base
+        del sim, img_f, targets, tf, w_carprt, w_oracle
+        torch.cuda.empty_cache()
+
+    banner("SUMMARY — do the label-free selectors beat CARPRT?")
+    sl.print_summary(all_best, bases)
+    results["selectors"] = {"best": all_best, "carprt": bases}
     return results
 
 
@@ -1608,7 +1681,7 @@ def main():
 
     if args.command in ("sweep", "residual", "oracle", "characterize",
                         "learn", "bayes", "validate", "dose",
-                        "diagnose", "select", "swapcurve", "stability"):
+                        "diagnose", "select", "swapcurve", "stability", "selectors"):
         runner = {"sweep": run_sweep, "residual": run_residual,
                   "oracle": run_oracle,
                   "characterize": run_characterize,
@@ -1619,7 +1692,8 @@ def main():
                   "diagnose": run_diagnose,
                   "select": run_select,
                   "swapcurve": run_swapcurve,
-                  "stability": run_stability}[args.command]
+                  "stability": run_stability,
+                  "selectors": run_selectors}[args.command]
         runner(args, clip_model, logit_scale, m_fit, z_fit, m_tgt, z_tgt,
                preprocess, results)
         print(f"\ndone in {time.time() - t0:.1f}s")
