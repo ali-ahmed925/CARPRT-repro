@@ -84,7 +84,7 @@ def get_args():
     p.add_argument("command", choices=["fit", "classify", "all", "sweep", "residual", "oracle",
                             "characterize", "learn", "bayes",
                             "validate", "dose", "diagnose",
-                            "select"])
+                            "select", "swapcurve"])
     p.add_argument("--fit-datasets", type=str, default="imagenet",
                    help="Slash-separated corpus for fitting, e.g. 'imagenet/sun397'.")
     p.add_argument("--target", type=str, default="oxford_pets",
@@ -117,6 +117,10 @@ def get_args():
                    help="v1 (default): original scoring; reproduces all numbers "
                         "generated before 2026-08-02. v2: alpha=0 is bit-exact "
                         "against CARPRT.")
+    p.add_argument("--with-pseudo", dest="with_pseudo", action="store_true",
+                   help="swapcurve: overlay the pseudo-label selector on the "
+                        "curve at its own overlap, to separate overlap quality "
+                        "from the quality of the non-oracle picks.")
     p.add_argument("--n-boot", dest="n_boot", type=int, default=20,
                    help="Bootstrap draws for the stability selector.")
     p.add_argument("--topk-list", dest="topk_list", type=str,
@@ -326,6 +330,80 @@ def _dose_classes(args, tf, img_f, targets, classnames, alphas, seeds, results):
         else:
             print(f"\n  >>> effect moves the WRONG way in C ({e_hi:+.2f} -> {e_lo:+.2f}).")
     results["dose_classes"] = rows
+    return results
+
+
+def run_swapcurve(args, clip_model, logit_scale, m_fit, z_fit, m_tgt, z_tgt,
+                  preprocess, results):
+    """Is accuracy LINEAR or CONVEX in overlap with the oracle's prompt set?
+
+    Everything downstream hangs on the answer. If linear, a selector that closes
+    half the overlap gap collects half the gain and `pseudo` raising overlap
+    15% -> 47% for -0.16 accuracy means something else is broken. If convex, the
+    payoff arrives only when the set is nearly exactly right, the `select` null
+    result is explained, and we learn the bar a selector has to clear.
+    """
+    from promptop import oracle as oracle_mod
+    from promptop import swap as sw
+
+    ks = [int(x) for x in args.topk_list.split(",") if x]
+    all_summ = {}
+
+    for name in [d for d in args.targets.split("/") if d]:
+        banner(f"{name}")
+        try:
+            loader, classnames, _ = build_test_data_loader(
+                loader_id(name), args.data_root, preprocess)
+        except Exception as exc:                                   # noqa: BLE001
+            print(f"  [skip] {type(exc).__name__}: {exc}")
+            continue
+
+        img_f, targets = infer_mod.encode_images(loader, clip_model)
+        tf = clip_classifier(classnames, TEMPLATES, clip_model)
+        n, p, c = img_f.shape[0], len(TEMPLATES), len(classnames)
+        gb = oracle_mod.estimate_bytes(n, p, c)
+        if gb > 4.0:
+            print(f"  [skip] similarity tensor would need {gb:.1f} GB")
+            del img_f, targets, tf
+            torch.cuda.empty_cache()
+            continue
+
+        sim = oracle_mod.similarity_tensor(img_f, tf, args.chunk)
+        w_carprt = infer_mod.carprt_weights(img_f, tf, args.temp, args.chunk)
+        _, theta0 = infer_mod.carprt_weights_split_value(
+            img_f, tf, tf, args.temp, args.chunk)
+        base = oracle_mod._accuracy(sim, w_carprt, targets)
+        w_oracle, orc, _ = oracle_mod.oracle_optimal_w(
+            sim, targets, theta0, args.temp, args.oracle_steps, args.oracle_lr)
+        print(f"  N={n} C={c}   CARPRT {base:.2f}   oracle {orc:.2f} "
+              f"({orc - base:+.2f})")
+
+        overlays = {}
+        if args.with_pseudo:
+            from promptop import select as sel
+            print("  fitting the pseudo-label selector for the overlay ...")
+            overlays["pseudo"] = sel.pseudo_label_scores(
+                sim, w_carprt, theta0, args.temp, args.learn_steps, args.oracle_lr)
+
+        for k in ks:
+            rows = sw.swap_curve(sim, targets, w_oracle, w_carprt, k, args.seed)
+            summ = sw.curve_summary(rows, base)
+            sw.print_curve(rows, summ, base, orc)
+            if overlays:
+                pts = {nm: sw.overlay_point(sim, targets, sc, w_oracle, k, rows)
+                       for nm, sc in overlays.items()}
+                sw.print_overlay(pts, base)
+                summ["overlay"] = pts
+            summ["carprt_full"] = base
+            summ["oracle_full"] = orc
+            all_summ[f"{name} k={k}" if len(ks) > 1 else name] = summ
+
+        del sim, img_f, targets, tf, w_carprt, w_oracle
+        torch.cuda.empty_cache()
+
+    banner("SUMMARY — does closing the overlap gap buy accuracy?")
+    sw.print_summary(all_summ)
+    results["swapcurve"] = all_summ
     return results
 
 
@@ -1477,7 +1555,7 @@ def main():
 
     if args.command in ("sweep", "residual", "oracle", "characterize",
                         "learn", "bayes", "validate", "dose",
-                        "diagnose", "select"):
+                        "diagnose", "select", "swapcurve"):
         runner = {"sweep": run_sweep, "residual": run_residual,
                   "oracle": run_oracle,
                   "characterize": run_characterize,
@@ -1486,7 +1564,8 @@ def main():
                   "validate": run_validate,
                   "dose": run_dose,
                   "diagnose": run_diagnose,
-                  "select": run_select}[args.command]
+                  "select": run_select,
+                  "swapcurve": run_swapcurve}[args.command]
         runner(args, clip_model, logit_scale, m_fit, z_fit, m_tgt, z_tgt,
                preprocess, results)
         print(f"\ndone in {time.time() - t0:.1f}s")
