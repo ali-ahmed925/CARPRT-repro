@@ -84,7 +84,7 @@ def get_args():
     p.add_argument("command", choices=["fit", "classify", "all", "sweep", "residual", "oracle",
                             "characterize", "learn", "bayes",
                             "validate", "dose", "diagnose",
-                            "select", "swapcurve"])
+                            "select", "swapcurve", "stability"])
     p.add_argument("--fit-datasets", type=str, default="imagenet",
                    help="Slash-separated corpus for fitting, e.g. 'imagenet/sun397'.")
     p.add_argument("--target", type=str, default="oxford_pets",
@@ -330,6 +330,59 @@ def _dose_classes(args, tf, img_f, targets, classnames, alphas, seeds, results):
         else:
             print(f"\n  >>> effect moves the WRONG way in C ({e_hi:+.2f} -> {e_lo:+.2f}).")
     results["dose_classes"] = rows
+    return results
+
+
+def run_stability(args, clip_model, logit_scale, m_fit, z_fit, m_tgt, z_tgt,
+                  preprocess, results):
+    """Is there a stable target for a selector to aim at?
+
+    Fits the oracle on two disjoint halves and asks whether its per-class prompt
+    choices agree, then whether choices made on one half beat CARPRT on the
+    other. That second number is an upper bound on any label-free selector: it
+    had real labels, just not on the images it is scored on.
+    """
+    from promptop import oracle as oracle_mod
+    from promptop import stability as stab
+
+    ks = [int(x) for x in args.topk_list.split(",") if x]
+    all_r = {}
+
+    for name in [d for d in args.targets.split("/") if d]:
+        banner(f"{name}")
+        try:
+            loader, classnames, _ = build_test_data_loader(
+                loader_id(name), args.data_root, preprocess)
+        except Exception as exc:                                   # noqa: BLE001
+            print(f"  [skip] {type(exc).__name__}: {exc}")
+            continue
+
+        img_f, targets = infer_mod.encode_images(loader, clip_model)
+        tf = clip_classifier(classnames, TEMPLATES, clip_model)
+        n, p, c = img_f.shape[0], len(TEMPLATES), len(classnames)
+        gb = oracle_mod.estimate_bytes(n, p, c)
+        if gb > 4.0:
+            print(f"  [skip] similarity tensor would need {gb:.1f} GB")
+            del img_f, targets, tf
+            torch.cuda.empty_cache()
+            continue
+
+        sim = oracle_mod.similarity_tensor(img_f, tf, args.chunk)
+        _, theta0 = infer_mod.carprt_weights_split_value(
+            img_f, tf, tf, args.temp, args.chunk)
+        print(f"  N={n} C={c}   fitting two oracles on disjoint halves ...")
+
+        r = stab.run(sim, targets, img_f, tf, theta0, ks, args.temp,
+                     args.oracle_steps, args.oracle_lr, args.chunk, args.seed)
+        stab.print_report(r)
+        all_r[name] = r
+
+        del sim, img_f, targets, tf
+        torch.cuda.empty_cache()
+
+    banner("VERDICT — is the target real, and does it transfer?")
+    stab.verdict(all_r, max(ks))
+    results["stability"] = all_r
     return results
 
 
@@ -1555,7 +1608,7 @@ def main():
 
     if args.command in ("sweep", "residual", "oracle", "characterize",
                         "learn", "bayes", "validate", "dose",
-                        "diagnose", "select", "swapcurve"):
+                        "diagnose", "select", "swapcurve", "stability"):
         runner = {"sweep": run_sweep, "residual": run_residual,
                   "oracle": run_oracle,
                   "characterize": run_characterize,
@@ -1565,7 +1618,8 @@ def main():
                   "dose": run_dose,
                   "diagnose": run_diagnose,
                   "select": run_select,
-                  "swapcurve": run_swapcurve}[args.command]
+                  "swapcurve": run_swapcurve,
+                  "stability": run_stability}[args.command]
         runner(args, clip_model, logit_scale, m_fit, z_fit, m_tgt, z_tgt,
                preprocess, results)
         print(f"\ndone in {time.time() - t0:.1f}s")
