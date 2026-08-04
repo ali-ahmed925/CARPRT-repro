@@ -155,6 +155,39 @@ the mass. The penalty shrinks with k (at k=10 the ratio is ~1.2:1) — concentra
 vs the +4.61 full-fit span used here) — so the top of this curve is partly memorisation.
 Needs the other seven before any of the above is load-bearing.
 
+### RESULT — all eight datasets, k = 3/6/10
+
+**Mean half-gain point 0.51** (linear = 0.50), ≥0.70 on **1 of 24** configs. Convexity is
+refuted across the board, not just on pets. **Mean break-even 0.18 of k.**
+
+Break-even at k=10: food101 0/10 · ucf101, dtd, flowers, fgvc, caltech 1/10 · eurosat,
+pets 2/10. Spans at k=10 run from +2.01 (food101) to +15.25 (dtd).
+
+**eurosat is non-monotone** at k=6 and k=10 — `gain@half` of 1.76 and 1.66 exceed 1, so
+accuracy at the midpoint beats the endpoint: 3 oracle prompts + 3 CARPRT fillers ≈ 67.4
+against 61.64 for all 6 oracle prompts. Its weights are so peaked that its #4–6 prompts hurt
+at equal weight, and "the oracle's top-k set" is not a valid target there beyond k=3.
+
+Design rules 1 and 2 above survive on all eight. Rule 3 became Experiment 4.
+
+---
+
+## Experiment 1c — is the target real? (`stability`, oxford_pets only)
+
+Fit the oracle on two disjoint halves and compare. Then force half A's picks into CARPRT's
+top-10 and score on B, with CARPRT re-estimated from B alone — a selector holding **real
+labels on an independent sample**, and therefore a hard ceiling on anything label-free.
+
+```
+top-1 identical           18.9%  (chance 0.4%)   -> 47x
+A's pick in B's ranking   88.1th percentile       median rank 15 of 247
+transfer (A->B) at k=10   91.34  (+1.80)          in-sample 93.24 (+3.71)
+```
+
+**The target is real, it transfers, and generalisation costs about half.** But the
+out-of-sample bar is higher than the in-sample curve implied: transfer breaks even at
+**j=3**, not 1–2. Not yet run on the other seven.
+
 ---
 
 ## Experiment 2 — the native-prompt control
@@ -172,19 +205,50 @@ all — which changes what the paper can claim. Must be known before building on
 
 ---
 
-## Experiment 3 — adaptive concentration (the method candidate)
+## Experiment 3 — three label-free selectors  ← RUN, ALL THREE FAILED
 
-Conditional on Experiment 1. Concentration is the only lever that works and its sign
-depends on ranking quality, which varies **per class**, not just per dataset. Every method
-so far concentrates uniformly everywhere: CARPRT spreads over all 247 for every class,
-top-k concentrates for every class.
+`promptop/selectors.py`, command `selectors`. Each keeps CARPRT's top-k and overrides only
+the first `j` slots, abstaining per class where the signal has no evidence, so `j=0` is a
+shared origin.
 
-The proposal is a per-class decision of *how much* to concentrate, driven by a label-free
-estimate of how trustworthy that class's ranking is. This is not magnitude estimation —
-the magnitudes stay uniform inside the chosen set. It is a choice of set *size*.
+| selector | signal | mean over 8 | positive | precision |
+|---|---|---|---|---|
+| `spread` | distribution shape; **no labels, no pseudo-labels** | **−0.37** | 2/8 | 5–26% |
+| `crossfit` | consensus from half the prompt pool, scoring the other half | −0.57 | 1/8 | 5–13% |
+| `margin` | margin against the class actually competing | −0.72 | 2/8 | 6–15% |
+| ORACLE | — | +8.25 | 8/8 | 100% |
 
-Design waits on the shape of the swap curve, which determines what a per-class confidence
-signal has to achieve to be worth anything.
+**The precision bar.** A correct pick is worth ≈ +1.2 and a wrong one costs ≈ −0.8, so
+break-even is `1.2p > 0.8(1−p)` → **p > 40%**. Best available is 26%. That gap is the whole
+failure. Precision against the oracle is also the wrong bar — a pick must beat the CARPRT
+prompt it **displaces**, which is far stronger than random.
+
+**Abstention (pets only).** Only `spread` is calibrated — precision 50/22/17/11% over the
+top 10/25/50/100% of classes, monotone, top decile clearing 40%. `margin` and `crossfit` are
+**anti**-calibrated, scoring 0% on the classes they are most confident about.
+
+**`spread` is the one worth keeping.** It is the only score using neither labels nor
+pseudo-labels, the only calibrated one, the only one with a real win (eurosat **+1.91**),
+and its precision rises *with* headroom (26% dtd, 23% ucf101, 20% eurosat vs 10–11% pets,
+food101) — the opposite of every pseudo-label-derived score.
+
+---
+
+## Experiment 4 — remove the truncation handicap  ← NOT RUN
+
+**A defect in Experiment 3's evaluation, not in the signals.** Every number above uses
+uniform-over-top-10, so `j=0` is CARPRT *truncated*: on pets **88.44 against 89.45**. Every
+selector was handicapped ~1 point before it acted. `spread`'s mean is −0.37 and the hole is
+about −1.
+
+The fix is to stop replacing CARPRT's weights and start adjusting them: keep the full
+247-prompt soft distribution and add mass to the selected prompt, scaled by `spread`'s
+confidence. Then the baseline is CARPRT exactly, the starting point is zero rather than −1,
+and the downside of a wrong pick is bounded by how much mass moves rather than by `1/k`.
+
+This is repairing an error introduced here, not a new idea — which is the only reason it
+ranks above the twelve attempts that already failed. One run to know. Hard-stop if it does
+not clear zero.
 
 ---
 
@@ -197,5 +261,36 @@ signal has to achieve to be worth anything.
 - No method may use labels. Oracles are rulers only.
 - McNemar against CARPRT, with the discordant count printed.
 - Every claim in `FINDINGS.md` gets the measurement that supports it, or gets deleted.
-  ("Existing methods select at chance" is already wrong — chance overlap for top-3 of 247
-  is 1.2%, and CARPRT scores 2.2–13.7× that.)
+  ("Existing methods select at chance" was wrong — chance overlap for top-3 of 247 is 1.2%,
+  and CARPRT scores 2.2–13.7× that. Corrected 2026-08-04.)
+
+---
+
+## Scoreboard
+
+| # | attempt | mean over 8 | status |
+|---|---|---|---|
+| 1–6 | Phase 1, magnitude estimation (operators, low-rank, transferable, learned W, shrinkage, count-power) | ≤ −0.22 | dead |
+| 7 | truncation to CARPRT's own top-k | negative except eurosat +4.27 | dead |
+| 8 | bootstrap stability | flat | dead |
+| 9 | `pseudo` | −0.16 to −1.40 | dead |
+| 10 | `margin` | −0.72 | dead |
+| 11 | `crossfit` | −0.57 | dead |
+| 12 | `spread` | **−0.37** | best so far, still negative |
+| 13 | Experiment 4 — remove the truncation handicap | — | not run |
+
+**Twelve attempts, zero methods that beat CARPRT on average.** One dataset-specific win
+keeps reappearing through three unrelated mechanisms (eurosat, via truncation, count-power
+and `spread`) and never generalises.
+
+### Where the overclaiming happened, so it is not repeated
+
+1. *"80% of the gain is selection"* — from the full-fit oracle with `k` tuned per dataset
+   using labels. Both inflate it.
+2. *"break-even 1/10, so find one prompt per class"* — in-sample only. `stability` put the
+   out-of-sample bar at j=3, and the precision arithmetic later put it at 40%.
+3. *"The target is real and it transfers"* — true, but measured **with labels on a held-out
+   half**. A ceiling, not a method, and it was presented as momentum.
+
+Each statement was true as measured. Each was presented as progress toward a method when
+none of them was one.

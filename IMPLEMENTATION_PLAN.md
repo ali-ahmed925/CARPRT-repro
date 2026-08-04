@@ -3,6 +3,25 @@
 Research directions that move past scalar reweighting of prompt–class similarities.
 Written 2026-08-01. Self-contained: assumes no memory of the conversation that produced it.
 
+> ## SUPERSEDED (2026-08-04)
+>
+> **This document is a record, not a plan.** Six further attempts have been made since the
+> status block below was written, all on the `testing-direction` branch. Current state lives
+> in [FINDINGS.md](FINDINGS.md) and [TESTING_DIRECTION.md](TESTING_DIRECTION.md).
+>
+> Summary: **twelve method attempts, none beats CARPRT on average.** Best label-free mean over
+> eight datasets is **−0.37** (`spread`), against the oracle's +8.25. The selection reframing
+> below turned out to be correct in direction and insufficient in practice — a selector needs
+> ~40% precision against the oracle and the best available signal reaches 26%.
+>
+> Two claims in the status block below are now known to be overstated:
+> - the ceiling numbers are **full-fit** oracles at per-dataset best `k`, both chosen with
+>   labels, so they are maxima rather than reachable targets;
+> - "the missing information is *which* prompts" is right, but improving *which* by 2–3×
+>   (measured, via `pseudo`) buys no accuracy.
+>
+> Ideas 1, 3 and 4 below remain untried.
+
 > ## STATUS (2026-08-02) — read [FINDINGS.md](FINDINGS.md) first
 >
 > **Idea 2 is closed. Six method attempts have now been made and measured across six
